@@ -21,7 +21,8 @@ use crate::policy::{
     CreateScheduledRuleRequest, GuestDefaultRateLimitApi, GuestWhitelistEntryApi, GuestWhitelistEntryRequest, InterfaceRateLimitApi,
     PolicyItem, PolicyRuntime, ScheduledRuleApi, SetInterfaceRateLimitRequest, UpdateScheduledRuleRequest, add_guest_whitelist,
     create_scheduled_rule, delete_guest_default, delete_iface_limit, delete_scheduled_rule, get_guest_defaults, get_guest_whitelist,
-    get_iface_limits, get_scheduled_rules, policy_items, remove_guest_whitelist, set_guest_default, set_guest_default_enabled,
+    get_iface_limits, get_scheduled_rules, policy_items, remove_device_bindings, remove_guest_whitelist, set_guest_default,
+    set_guest_default_enabled,
     set_iface_limit, update_scheduled_rule,
 };
 use crate::topology::TopologySnapshot;
@@ -126,6 +127,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/overview", get(overview))
         .route("/api/devices", get(devices))
         .route("/api/devices/hostname", put(set_device_hostname_handler))
+        .route("/api/devices/{iface}/{mac}", delete(delete_device_handler))
         .route("/api/trend", get(history))
         .route("/api/histogram", get(aggregate))
         .route("/api/usage_ranking", get(usage_ranking))
@@ -450,6 +452,162 @@ async fn set_device_hostname_handler(
         iface, mac_norm, hostname
     );
 
+    Json(ApiEnvelope {
+        ok: true,
+        data: "ok",
+        error: None,
+    })
+}
+
+async fn delete_device_handler(
+    State(state): State<ApiState>,
+    Path((iface, mac_raw)): Path<(String, String)>,
+) -> Json<ApiEnvelope<&'static str>> {
+    let iface = iface.trim();
+    if iface.is_empty() {
+        warn!("api DELETE /api/devices/{{iface}}/{{mac}} rejected: iface is required");
+        return Json(ApiEnvelope {
+            ok: false,
+            data: "error",
+            error: Some("iface is required".to_string()),
+        });
+    }
+
+    let mac = match mac_utils::from_str(mac_raw.trim()) {
+        Ok(v) => v,
+        Err(_) => {
+            warn!(
+                "api DELETE /api/devices/{{iface}}/{{mac}} rejected: invalid mac iface={} mac_raw={}",
+                iface, mac_raw
+            );
+            return Json(ApiEnvelope {
+                ok: false,
+                data: "error",
+                error: Some("invalid mac format".to_string()),
+            });
+        }
+    };
+    let mac_norm = mac_utils::to_string(&mac);
+
+    let ifindex = {
+        let topo = state.topology.read().await;
+        let Some(v) = topo.ifindex_by_name(iface) else {
+            warn!(
+                "api DELETE /api/devices/{{iface}}/{{mac}} rejected: unknown iface={} mac={}",
+                iface, mac_norm
+            );
+            return Json(ApiEnvelope {
+                ok: false,
+                data: "error",
+                error: Some(format!("unknown iface: {iface}")),
+            });
+        };
+        v
+    };
+
+    let mut removed_any = false;
+
+    {
+        let mut snap = state.snapshot.write().await;
+        let before = snap.devices.len();
+        snap.devices
+            .retain(|d| !(d.ifindex == ifindex && d.mac.eq_ignore_ascii_case(&mac_norm)));
+        removed_any = removed_any || before != snap.devices.len();
+    }
+
+    {
+        let mut runtime = state.monitor_runtime.write().await;
+        removed_any = runtime.device_registry.entries.remove(&(ifindex, mac)).is_some() || removed_any;
+        removed_any = runtime.cumulative_device.remove(&(ifindex, mac)).is_some() || removed_any;
+        let prev_before = runtime.prev_device_bytes.len();
+        runtime
+            .prev_device_bytes
+            .retain(|k, _| !(k.ifindex == ifindex && k.mac == mac));
+        removed_any = removed_any || prev_before != runtime.prev_device_bytes.len();
+    }
+
+    {
+        let mut history = state.history.write().await;
+        history.remove_device(ifindex, &mac_norm);
+    }
+    {
+        let mut histogram = state.histogram.write().await;
+        histogram.remove_device(ifindex, &mac_norm);
+    }
+
+    {
+        let mut policy = state.policy_runtime.write().await;
+        let before_rules = get_scheduled_rules(&policy).len();
+        let before_wl = get_guest_whitelist(&policy).len();
+        remove_device_bindings(&mut policy, iface, mac);
+        let after_rules = get_scheduled_rules(&policy).len();
+        let after_wl = get_guest_whitelist(&policy).len();
+        removed_any = removed_any || before_rules != after_rules || before_wl != after_wl;
+    }
+
+    if !removed_any {
+        warn!(
+            "api DELETE /api/devices/{{iface}}/{{mac}} rejected: device not found iface={} mac={}",
+            iface, mac_norm
+        );
+        return Json(ApiEnvelope {
+            ok: false,
+            data: "error",
+            error: Some("device not found".to_string()),
+        });
+    }
+
+    if let Err(e) = persist_monitor_runtime_state(&state).await {
+        warn!(
+            "api DELETE /api/devices/{{iface}}/{{mac}} failed persist monitor iface={} mac={} err={}",
+            iface, mac_norm, e
+        );
+        return Json(ApiEnvelope {
+            ok: false,
+            data: "error",
+            error: Some(format!("persist devices state failed: {}", e)),
+        });
+    }
+    if let Err(e) = persist_histogram_current_hour_state(&state).await {
+        warn!(
+            "api DELETE /api/devices/{{iface}}/{{mac}} failed persist histogram iface={} mac={} err={}",
+            iface, mac_norm, e
+        );
+        return Json(ApiEnvelope {
+            ok: false,
+            data: "error",
+            error: Some(format!("persist histogram state failed: {}", e)),
+        });
+    }
+    if let Err(e) = persist_policy_state(&state).await {
+        warn!(
+            "api DELETE /api/devices/{{iface}}/{{mac}} failed persist policy iface={} mac={} err={}",
+            iface, mac_norm, e
+        );
+        return Json(ApiEnvelope {
+            ok: false,
+            data: "error",
+            error: Some(format!("persist policy failed: {}", e)),
+        });
+    }
+    if let Some(p) = &state.persistence {
+        if let Err(e) = p.remove_device_history_file(iface, &mac_norm) {
+            warn!(
+                "api DELETE /api/devices/{{iface}}/{{mac}} failed remove device ring iface={} mac={} err={}",
+                iface, mac_norm, e
+            );
+            return Json(ApiEnvelope {
+                ok: false,
+                data: "error",
+                error: Some(format!("remove device history file failed: {}", e)),
+            });
+        }
+    }
+
+    info!(
+        "api DELETE /api/devices/{{iface}}/{{mac}} ok iface={} mac={}",
+        iface, mac_norm
+    );
     Json(ApiEnvelope {
         ok: true,
         data: "ok",
@@ -1108,6 +1266,15 @@ async fn persist_monitor_runtime_state(state: &ApiState) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn persist_histogram_current_hour_state(state: &ApiState) -> anyhow::Result<()> {
+    if let Some(p) = &state.persistence {
+        let histogram = state.histogram.read().await;
+        let topo = state.topology.read().await;
+        p.save_current_hour_histogram(&histogram, &topo)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,6 +1284,7 @@ mod tests {
     use crate::utils::system_utils::InterfaceRole;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use bandix_plus_common::DeviceTrafficKey;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
@@ -1299,6 +1467,153 @@ mod tests {
         let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
         assert!(!env.ok);
         assert!(env.error.unwrap().contains("unknown iface"));
+    }
+
+    #[tokio::test]
+    async fn api_delete_device_success() {
+        let state = mock_api_state();
+        {
+            let mut snap = state.snapshot.write().await;
+            snap.timestamp_ms = 1000;
+            snap.devices.push(DeviceListItem {
+                ifindex: 1,
+                logical_iface: "eth0".to_string(),
+                subnet: "-".to_string(),
+                ipv4: vec!["192.168.1.2".to_string()],
+                ipv6: vec![],
+                mac: "aa:bb:cc:dd:ee:ff".to_string(),
+                hostname: "phone".to_string(),
+                metrics: CounterQuad::default(),
+                cumulative: CounterQuad::default(),
+                online: true,
+                last_seen_ms: 0,
+                neighbor_state: None,
+            });
+            state.history.write().await.ingest_snapshot(&snap);
+            state.histogram.write().await.ingest_snapshot(&snap);
+        }
+        {
+            let mac = crate::utils::mac_utils::from_str("aa:bb:cc:dd:ee:ff").unwrap();
+            let mut runtime = state.monitor_runtime.write().await;
+            runtime.device_registry.entries.insert(
+                (1, mac),
+                KnownDevice {
+                    ifindex: 1,
+                    mac,
+                    ipv4: vec!["192.168.1.2".to_string()],
+                    ipv6: vec![],
+                    hostname: "phone".to_string(),
+                    logical_iface: "eth0".to_string(),
+                    subnet: "-".to_string(),
+                    last_seen_ms: 1,
+                },
+            );
+            runtime.cumulative_device.insert((1, mac), CounterQuad::default());
+            runtime.prev_device_bytes.insert(
+                DeviceTrafficKey {
+                    ifindex: 1,
+                    mac,
+                    ip_version: 4,
+                    direction: 1,
+                },
+                123,
+            );
+        }
+
+        let app = router(state.clone());
+        let wl_body = serde_json::json!({ "iface": "eth0", "mac": "aa:bb:cc:dd:ee:ff" });
+        let wl_req = Request::post("/api/rate_limit/guest_whitelist")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&wl_body).unwrap()))
+            .unwrap();
+        let wl_res = app.clone().oneshot(wl_req).await.unwrap();
+        assert_eq!(wl_res.status(), StatusCode::OK);
+
+        let schedule_body = serde_json::json!({
+            "iface": "eth0",
+            "mac": "aa:bb:cc:dd:ee:ff",
+            "time_slot": { "start": "09:00", "end": "18:00", "days": [1,2,3,4,5] },
+            "down_v4_kbps": 1000,
+            "down_v6_kbps": 1000,
+            "up_v4_kbps": 1000,
+            "up_v6_kbps": 1000
+        });
+        let sch_req = Request::post("/api/rate_limit/schedules")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&schedule_body).unwrap()))
+            .unwrap();
+        let sch_res = app.clone().oneshot(sch_req).await.unwrap();
+        assert_eq!(sch_res.status(), StatusCode::OK);
+
+        let req = Request::delete("/api/devices/eth0/aa:bb:cc:dd:ee:ff")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(env.ok);
+
+        let snap = state.snapshot.read().await;
+        assert!(snap.devices.is_empty());
+        drop(snap);
+
+        let runtime = state.monitor_runtime.read().await;
+        let mac = crate::utils::mac_utils::from_str("aa:bb:cc:dd:ee:ff").unwrap();
+        assert!(!runtime.device_registry.entries.contains_key(&(1, mac)));
+        assert!(!runtime.cumulative_device.contains_key(&(1, mac)));
+        assert!(runtime.prev_device_bytes.is_empty());
+        drop(runtime);
+
+        let trend_req = Request::get("/api/trend?iface=eth0&mac=aa:bb:cc:dd:ee:ff")
+            .body(Body::empty())
+            .unwrap();
+        let trend_res = app.clone().oneshot(trend_req).await.unwrap();
+        let trend_body = trend_res.into_body().collect().await.unwrap().to_bytes();
+        let trend_env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&trend_body).unwrap();
+        assert!(trend_env.ok);
+        assert_eq!(trend_env.data.as_array().map(|x| x.len()), Some(0));
+
+        let policy_req = Request::get("/api/policy").body(Body::empty()).unwrap();
+        let policy_res = app.clone().oneshot(policy_req).await.unwrap();
+        let policy_body = policy_res.into_body().collect().await.unwrap().to_bytes();
+        let policy_env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&policy_body).unwrap();
+        assert!(policy_env.ok);
+        let rows = policy_env.data.as_array().cloned().unwrap_or_default();
+        assert!(rows.iter().all(|x| {
+            x.get("mac")
+                .and_then(|v| v.as_str())
+                .map(|m| !m.eq_ignore_ascii_case("aa:bb:cc:dd:ee:ff"))
+                .unwrap_or(true)
+        }));
+    }
+
+    #[tokio::test]
+    async fn api_delete_device_not_found() {
+        let app = router(mock_api_state());
+        let req = Request::delete("/api/devices/eth0/aa:bb:cc:dd:ee:ff")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(!env.ok);
+        assert!(env.error.unwrap().contains("device not found"));
+    }
+
+    #[tokio::test]
+    async fn api_delete_device_invalid_mac() {
+        let app = router(mock_api_state());
+        let req = Request::delete("/api/devices/eth0/not-a-mac")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert!(!env.ok);
+        assert!(env.error.unwrap().contains("invalid mac"));
     }
 
     #[tokio::test]

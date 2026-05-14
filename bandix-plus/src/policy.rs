@@ -506,6 +506,11 @@ pub fn remove_guest_whitelist(runtime: &mut PolicyRuntime, req: GuestWhitelistEn
     Ok(())
 }
 
+pub fn remove_device_bindings(runtime: &mut PolicyRuntime, iface: &str, mac: [u8; 6]) {
+    runtime.scheduled_rules.retain(|r| !(r.iface == iface && r.mac == mac));
+    runtime.guest_whitelist.retain(|(x, y)| !(x == iface && *y == mac));
+}
+
 pub(crate) fn compute_desired_limits(
     runtime: &PolicyRuntime,
     observed_pairs: &[(u32, [u8; 6])],

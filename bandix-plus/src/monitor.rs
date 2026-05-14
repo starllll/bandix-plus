@@ -472,6 +472,13 @@ impl HistogramHistory {
             .insert(DeviceSeriesKey { ifindex, mac }, (hour_start, restored_points));
     }
 
+    pub fn remove_device(&mut self, ifindex: u32, mac: &str) {
+        self.current_hour_device
+            .retain(|k, _| !(k.ifindex == ifindex && k.mac.eq_ignore_ascii_case(mac)));
+        self.completed_device
+            .retain(|k, _| !(k.ifindex == ifindex && k.mac.eq_ignore_ascii_case(mac)));
+    }
+
     fn ingest_iface(&mut self, ifindex: u32, ts_ms: u64, metrics: &CounterQuad) -> Option<AggregatedBucket> {
         let (hour_start, _) = hourly_bucket_local(ts_ms);
         let entry = self.current_hour_iface.entry(ifindex).or_insert_with(|| {
@@ -851,6 +858,11 @@ impl TrafficHistory {
                 down_v6_bytes_cumulative: cumulative.down_v6_bytes,
             })
             .collect()
+    }
+
+    pub fn remove_device(&mut self, ifindex: u32, mac: &str) {
+        self.device_series
+            .retain(|k, _| !(k.ifindex == ifindex && k.mac.eq_ignore_ascii_case(mac)));
     }
 }
 

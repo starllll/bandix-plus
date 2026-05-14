@@ -231,6 +231,18 @@ impl PersistenceManager {
         append_ring_record(&path, &RingRecord { bucket: bucket.clone() })
     }
 
+    pub fn remove_device_history_file(&self, iface_name: &str, mac: &str) -> anyhow::Result<()> {
+        let mac_hex = normalize_mac_hex(mac).ok_or_else(|| anyhow::anyhow!("invalid mac for ring path: {}", mac))?;
+        let path = self
+            .device_traffic_dir
+            .join(format!("{}-{}.ring", encode_component(iface_name), mac_hex));
+        if !path.exists() {
+            return Ok(());
+        }
+        fs::remove_file(path)?;
+        Ok(())
+    }
+
     pub fn load_histogram(&self, topology: &TopologySnapshot, histogram: &mut HistogramHistory) -> anyhow::Result<()> {
         self.load_iface_histogram(topology, histogram)?;
         self.load_device_histogram(topology, histogram)?;
