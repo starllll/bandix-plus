@@ -74,6 +74,8 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         options.traffic_enable_storage
     );
 
+    log::info!("virtual interfaces: {:?}", options.virtual_iface);
+
     let policy = parse_policy();
 
     let mut policy_runtime_raw = init_runtime(policy);
@@ -140,6 +142,9 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         options.tcx_anchor_egress_id,
     )?;
 
+    // 设置虚拟接口映射到eBPF程序
+    setup_virtual_interfaces(&ebpf, &options.virtual_iface, &topology)?;
+
     let collect_interval = Duration::from_secs(collect_interval_secs);
     let mut collector_ebpf = ebpf;
     let collector_topology = Arc::clone(&topology_state);
@@ -149,6 +154,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let collector_monitor_runtime = Arc::clone(&monitor_runtime);
     let collector_policy_runtime = Arc::clone(&policy_runtime);
     let collector_monitor_ifaces = monitor_ifaces;
+    let collector_virtual_ifaces = options.virtual_iface.clone(); // 保存虚拟接口列表
     let collector_persistence = Arc::clone(&persistence);
     let collector_traffic_enable_storage = options.traffic_enable_storage;
     tokio::spawn(async move {
@@ -204,6 +210,12 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
                                         log::error!("persist device ring failed iface={} mac={} err={}", iface, mac, e);
                                     }
                                 }
+                                // 新增：处理IP统计的持久化
+                                CompletedAggregate::Ip { iface, ip, bucket } => {
+                                    if let Err(e) = collector_persistence.append_ip_bucket(&iface, &ip, &bucket) {
+                                        log::error!("persist ip ring failed iface={} ip={} err={}", iface, ip, e);
+                                    }
+                                }
                             }
                         }
                     }
@@ -253,6 +265,33 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let bind_addr = format!("{}:{}", options.host, options.port);
     log::info!("API server listening on {}", bind_addr);
     start_server(&bind_addr, api_state).await?;
+
+    Ok(())
+}
+
+/// 设置虚拟接口映射到eBPF程序
+fn setup_virtual_interfaces(ebpf: &aya::Ebpf, virtual_ifaces: &[String], topology: &TopologySnapshot) -> anyhow::Result<()> {
+    // 获取虚拟接口的ifindex
+    let virtual_ifindices: Vec<u32> = virtual_ifaces
+        .iter()
+        .filter_map(|iface_name| topology.ifindex_by_name(iface_name))
+        .collect();
+
+    if !virtual_ifindices.is_empty() {
+        log::info!("Setting up virtual interfaces for IP-level monitoring: {:?}", virtual_ifindices);
+        
+        // 尝试访问eBPF中的VIRTUAL_INTERFACES_MAP（如果存在）
+        if let Ok(mut map) = ebpf.map_mut("VIRTUAL_INTERFACES_MAP") {
+            use aya::maps::HashMap as AyaHashMap;
+            let virtual_iface_map: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(map)?;
+            
+            for &ifindex in &virtual_ifindices {
+                virtual_iface_map.insert(ifindex, 1, 0)?;
+            }
+        } else {
+            log::warn!("VIRTUAL_INTERFACES_MAP not found in eBPF program, virtual interface detection will not work");
+        }
+    }
 
     Ok(())
 }

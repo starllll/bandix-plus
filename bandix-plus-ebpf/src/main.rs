@@ -9,7 +9,7 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use bandix_plus_common::{
-    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, InterfaceTrafficKey, IpVersion, RateBucketValue,
+    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, InterfaceTrafficKey, IpTrafficKey, IpVersion, RateBucketValue,
     RateLimitValue, TrafficDirection, TrafficValue,
 };
 
@@ -41,6 +41,32 @@ struct EthHdr {
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
+struct Ipv4Hdr {
+    version_ihl: u8,
+    tos: u8,
+    tot_len: u16,
+    id: u16,
+    frag_off: u16,
+    ttl: u8,
+    protocol: u8,
+    check: u16,
+    saddr: [u8; 4],
+    daddr: [u8; 4],
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Ipv6Hdr {
+    version_class_flow: u32,
+    payload_len: u16,
+    next_header: u8,
+    hop_limit: u8,
+    saddr: [u8; 16],
+    daddr: [u8; 16],
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
 struct PppoeSessionHdr {
     ver_type: u8,
     code: u8,
@@ -53,6 +79,8 @@ struct PppoeSessionHdr {
 struct PacketMeta {
     ip_version: u8,
     mac: Option<[u8; 6]>,
+    src_ip: Option<[u8; 16]>,
+    dst_ip: Option<[u8; 16]>,
 }
 
 #[classifier]
@@ -76,6 +104,14 @@ static IFACE_TRAFFIC_STATS: HashMap<InterfaceTrafficKey, TrafficValue> = HashMap
 
 #[map]
 static DEVICE_TRAFFIC_STATS: HashMap<DeviceTrafficKey, TrafficValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
+
+// 新增：IP级别流量统计图
+#[map]
+static IP_TRAFFIC_STATS: HashMap<IpTrafficKey, TrafficValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
+
+// 新增：虚拟接口映射
+#[map]
+static VIRTUAL_INTERFACES_MAP: HashMap<u32, u8> = HashMap::with_max_entries(MAX_ENTRIES, 0);
 
 #[map]
 static DEVICE_LIMIT_GLOBAL: HashMap<DeviceGlobalLimitKey, RateLimitValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
@@ -119,6 +155,35 @@ fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
         bump_device_counter(&device_key, pkt_len);
     }
 
+    // 检查是否是虚拟接口（如tailscale），如果是则按IP统计
+    if is_virtual_interface(ifindex) {
+        if let Some(src_ip) = meta.src_ip {
+            let ip_key = IpTrafficKey {
+                ifindex,
+                ip_addr: src_ip,
+                ip_version: meta.ip_version,
+                direction,
+                _pad: [0; 2],
+            };
+            bump_ip_counter(&ip_key, pkt_len);
+        }
+        
+        if let Some(dst_ip) = meta.dst_ip {
+            let ip_key = IpTrafficKey {
+                ifindex,
+                ip_addr: dst_ip,
+                ip_version: meta.ip_version,
+                direction: if direction == TrafficDirection::Ingress as u8 {
+                    TrafficDirection::Egress as u8
+                } else {
+                    TrafficDirection::Ingress as u8
+                }, // 对于目的IP，反向方向
+                _pad: [0; 2],
+            };
+            bump_ip_counter(&ip_key, pkt_len);
+        }
+    }
+
     if should_drop_by_rate_limit(ifindex, meta.mac, meta.ip_version, direction, pkt_len) {
         return Ok(TC_ACT_SHOT);
     }
@@ -126,45 +191,165 @@ fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
     Ok(TC_ACT_UNSPEC)
 }
 
+// 检查是否是虚拟接口，例如tailscale、wg、tun等
+fn is_virtual_interface(ifindex: u32) -> bool {
+    // 检查虚拟接口映射表
+    unsafe {
+        match VIRTUAL_INTERFACES_MAP.get(&ifindex) {
+            Some(_) => true,
+            None => false,
+        }
+    }
+}
+
 fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
     if let Ok(eth) = ptr_at::<EthHdr>(ctx, 0) {
         let eth_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_proto)) });
-        if let Some(ip_version) = resolve_ip_version_from_eth(ctx, eth_proto) {
+        if let Some((ip_version, src_ip, dst_ip)) = resolve_ip_info_from_eth(ctx, eth_proto) {
             let mac = match direction {
                 x if x == TrafficDirection::Ingress as u8 => {
                     Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_source)) })
                 }
                 _ => Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_dest)) }),
             };
-            return Some(PacketMeta { ip_version, mac });
+            return Some(PacketMeta { ip_version, mac, src_ip, dst_ip });
         }
     }
 
     // L3-style interfaces (e.g. ppp/tun/wireguard) may have no Ethernet header.
-    if let Some(ip_version) = resolve_ip_version_from_l3(ctx, 0) {
-        return Some(PacketMeta { ip_version, mac: None });
+    if let Some((ip_version, src_ip, dst_ip)) = resolve_ip_info_from_l3(ctx, 0) {
+        return Some(PacketMeta { ip_version, mac: None, src_ip, dst_ip });
     }
-    if let Some(ip_version) = resolve_ip_version_from_ppp(ctx) {
-        return Some(PacketMeta { ip_version, mac: None });
+    if let Some((ip_version, src_ip, dst_ip)) = resolve_ip_info_from_ppp(ctx) {
+        return Some(PacketMeta { ip_version, mac: None, src_ip, dst_ip });
     }
     None
 }
 
-fn resolve_ip_version_from_eth(ctx: &TcContext, eth_proto: u16) -> Option<u8> {
+fn resolve_ip_info_from_eth(ctx: &TcContext, eth_proto: u16) -> Option<(u8, Option<[u8; 16]>, Option<[u8; 16]>)> {
     match eth_proto {
-        ETH_P_IP => Some(IpVersion::V4 as u8),
-        ETH_P_IPV6 => Some(IpVersion::V6 as u8),
+        ETH_P_IP => {
+            if let Ok(ipv4) = ptr_at::<Ipv4Hdr>(ctx, core::mem::size_of::<EthHdr>()) {
+                let saddr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ipv4).saddr)) };
+                let daddr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ipv4).daddr)) };
+                
+                // 转换IPv4地址为16字节格式（IPv4-mapped IPv6 address格式）
+                let mut src_ip = [0u8; 16];
+                let mut dst_ip = [0u8; 16];
+                src_ip[12..16].copy_from_slice(&saddr);
+                dst_ip[12..16].copy_from_slice(&daddr);
+                
+                Some((IpVersion::V4 as u8, Some(src_ip), Some(dst_ip)))
+            } else {
+                Some((IpVersion::V4 as u8, None, None))
+            }
+        },
+        ETH_P_IPV6 => {
+            if let Ok(ipv6) = ptr_at::<Ipv6Hdr>(ctx, core::mem::size_of::<EthHdr>()) {
+                let saddr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ipv6).saddr)) };
+                let daddr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ipv6).daddr)) };
+                
+                Some((IpVersion::V6 as u8, Some(saddr), Some(daddr)))
+            } else {
+                Some((IpVersion::V6 as u8, None, None))
+            }
+        },
         ETH_P_PPP_SES => {
             let pppoe = ptr_at::<PppoeSessionHdr>(ctx, core::mem::size_of::<EthHdr>()).ok()?;
             let ppp_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*pppoe).ppp_proto)) });
             match ppp_proto {
-                PPP_PROTO_IP => Some(IpVersion::V4 as u8),
-                PPP_PROTO_IPV6 => Some(IpVersion::V6 as u8),
+                PPP_PROTO_IP => {
+                    if let Ok(ipv4) = ptr_at::<Ipv4Hdr>(ctx, core::mem::size_of::<EthHdr>() + core::mem::size_of::<PppoeSessionHdr>()) {
+                        let saddr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ipv4).saddr)) };
+                        let daddr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ipv4).daddr)) };
+                        
+                        // 转换IPv4地址为16字节格式
+                        let mut src_ip = [0u8; 16];
+                        let mut dst_ip = [0u8; 16];
+                        src_ip[12..16].copy_from_slice(&saddr);
+                        dst_ip[12..16].copy_from_slice(&daddr);
+                        
+                        Some((IpVersion::V4 as u8, Some(src_ip), Some(dst_ip)))
+                    } else {
+                        Some((IpVersion::V4 as u8, None, None))
+                    }
+                },
+                PPP_PROTO_IPV6 => {
+                    if let Ok(ipv6) = ptr_at::<Ipv6Hdr>(ctx, core::mem::size_of::<EthHdr>() + core::mem::size_of::<PppoeSessionHdr>()) {
+                        let saddr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ipv6).saddr)) };
+                        let daddr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ipv6).daddr)) };
+                        
+                        Some((IpVersion::V6 as u8, Some(saddr), Some(daddr)))
+                    } else {
+                        Some((IpVersion::V6 as u8, None, None))
+                    }
+                },
                 _ => None,
             }
         }
         _ => None,
     }
+}
+
+fn resolve_ip_info_from_l3(ctx: &TcContext, offset: usize) -> Option<(u8, Option<[u8; 16]>, Option<[u8; 16]>)> {
+    let first2 = ptr_at::<u16>(ctx, offset).ok()?;
+    let first2 = u16::from_be(unsafe { core::ptr::read_unaligned(first2) });
+    let version = (first2 >> 12) as u8;
+    
+    match version {
+        4 => {
+            if let Ok(ipv4) = ptr_at::<Ipv4Hdr>(ctx, offset) {
+                let saddr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ipv4).saddr)) };
+                let daddr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ipv4).daddr)) };
+                
+                // 转换IPv4地址为16字节格式
+                let mut src_ip = [0u8; 16];
+                let mut dst_ip = [0u8; 16];
+                src_ip[12..16].copy_from_slice(&saddr);
+                dst_ip[12..16].copy_from_slice(&daddr);
+                
+                Some((IpVersion::V4 as u8, Some(src_ip), Some(dst_ip)))
+            } else {
+                Some((IpVersion::V4 as u8, None, None))
+            }
+        },
+        6 => {
+            if let Ok(ipv6) = ptr_at::<Ipv6Hdr>(ctx, offset) {
+                let saddr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ipv6).saddr)) };
+                let daddr = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*ipv6).daddr)) };
+                
+                Some((IpVersion::V6 as u8, Some(saddr), Some(daddr)))
+            } else {
+                Some((IpVersion::V6 as u8, None, None))
+            }
+        },
+        _ => None,
+    }
+}
+
+fn resolve_ip_info_from_ppp(ctx: &TcContext) -> Option<(u8, Option<[u8; 16]>, Option<[u8; 16]>)> {
+    if let Ok(proto_ptr) = ptr_at::<u16>(ctx, 0) {
+        let proto = u16::from_be(unsafe { core::ptr::read_unaligned(proto_ptr) });
+        match proto {
+            PPP_PROTO_IP => {
+                if let Some(info) = resolve_ip_info_from_l3(ctx, 2) {
+                    return Some(info);
+                }
+            },
+            PPP_PROTO_IPV6 => {
+                if let Some(info) = resolve_ip_info_from_l3(ctx, 2) {
+                    return Some(info);
+                }
+            },
+            _ => {}
+        }
+        // Protocol field + L3 payload.
+        if let Some(ip_version) = resolve_ip_version_from_l3(ctx, 2) {
+            // 这里我们无法轻易提取IP地址，所以只返回版本信息
+            return Some((ip_version, None, None));
+        }
+    }
+    None
 }
 
 fn resolve_ip_version_from_l3(ctx: &TcContext, offset: usize) -> Option<u8> {
@@ -176,22 +361,6 @@ fn resolve_ip_version_from_l3(ctx: &TcContext, offset: usize) -> Option<u8> {
         6 => Some(IpVersion::V6 as u8),
         _ => None,
     }
-}
-
-fn resolve_ip_version_from_ppp(ctx: &TcContext) -> Option<u8> {
-    if let Ok(proto_ptr) = ptr_at::<u16>(ctx, 0) {
-        let proto = u16::from_be(unsafe { core::ptr::read_unaligned(proto_ptr) });
-        match proto {
-            PPP_PROTO_IP => return Some(IpVersion::V4 as u8),
-            PPP_PROTO_IPV6 => return Some(IpVersion::V6 as u8),
-            _ => {}
-        }
-        // Protocol field + L3 payload.
-        if let Some(ip_version) = resolve_ip_version_from_l3(ctx, 2) {
-            return Some(ip_version);
-        }
-    }
-    None
 }
 
 fn ptr_at<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
@@ -227,6 +396,20 @@ fn bump_device_counter(key: &DeviceTrafficKey, bytes: u64) {
 
         let value = TrafficValue { packets: 1, bytes };
         let _ = DEVICE_TRAFFIC_STATS.insert(key, &value, 0);
+    }
+}
+
+// 新增：更新IP级别计数器
+fn bump_ip_counter(key: &IpTrafficKey, bytes: u64) {
+    unsafe {
+        if let Some(value) = IP_TRAFFIC_STATS.get_ptr_mut(key) {
+            (*value).packets = (*value).packets.saturating_add(1);
+            (*value).bytes = (*value).bytes.saturating_add(bytes);
+            return;
+        }
+
+        let value = TrafficValue { packets: 1, bytes };
+        let _ = IP_TRAFFIC_STATS.insert(key, &value, 0);
     }
 }
 
@@ -480,4 +663,4 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 #[unsafe(link_section = "license")]
 #[unsafe(no_mangle)]
-static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
+static LICENSE: [u8; 13] = *b"aDual MIT/GPL\0";

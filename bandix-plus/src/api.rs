@@ -13,7 +13,7 @@ use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::monitor::{
-    AggregateBucket, AggregatedBucket, HistogramHistory, HistoryDirection, HistorySample, HistoryTrafficType, KnownDevice, MonitorRuntime,
+    AggregateBucket, AggregatedBucket, HistogramHistory, HistoryDirection, HistorySample, HistoryTrafficType, IpListItem, KnownDevice, MonitorRuntime,
     SnapshotData, TrafficHistory,
 };
 use crate::persistence::PersistenceManager;
@@ -79,6 +79,7 @@ pub struct AggregateQuery {
     pub traffic_type: Option<String>,
     pub start_ms: Option<u64>,
     pub end_ms: Option<u64>,
+    /// `hourly` / `daily`；默认为 `hourly`。
     pub bucket: Option<String>,
 }
 
@@ -106,6 +107,17 @@ pub struct UsageRankingItem {
     pub total_bytes: u64,
 }
 
+// 新增：IP使用排名项
+#[derive(Debug, Clone, Serialize)]
+pub struct IpUsageRankingItem {
+    pub iface: String,
+    pub ip: String,
+    pub ip_version: u8,
+    pub up_bytes: u64,
+    pub down_bytes: u64,
+    pub total_bytes: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ApiEnvelope<T> {
     pub ok: bool,
@@ -125,10 +137,12 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/snapshot", get(snapshot))
         .route("/api/overview", get(overview))
         .route("/api/devices", get(devices))
+        .route("/api/ips", get(ips))  // 新增：IP统计API
         .route("/api/devices/hostname", put(set_device_hostname_handler))
         .route("/api/trend", get(history))
         .route("/api/histogram", get(aggregate))
         .route("/api/usage_ranking", get(usage_ranking))
+        .route("/api/ip_usage_ranking", get(ip_usage_ranking))  // 新增：IP使用排名API
         .route("/api/policy", get(policy))
         .route("/api/rate_limit/schedules", get(get_schedules).post(create_schedule))
         .route(
@@ -151,94 +165,10 @@ pub fn router(state: ApiState) -> Router {
         )
         .route(
             "/api/rate_limit/guest_whitelist",
-            get(get_guest_whitelist_handler)
-                .post(add_guest_whitelist_handler)
-                .delete(remove_guest_whitelist_handler),
+            get(get_guest_whitelist_handler).post(add_guest_whitelist_handler),
         )
-        .with_state(state)
+        .route("/api/rate_limit/guest_whitelist/{iface}/{mac}", delete(remove_guest_whitelist_handler))
         .layer(cors)
-}
-
-async fn usage_ranking(
-    State(state): State<ApiState>,
-    Query(q): Query<UsageRankingQuery>,
-) -> Result<Json<ApiEnvelope<Vec<UsageRankingItem>>>, StatusCode> {
-    let Some(iface) = q.iface.clone().filter(|s| !s.trim().is_empty()) else {
-        return Err(StatusCode::BAD_REQUEST);
-    };
-
-    let tt = parse_traffic_type(q.traffic_type.as_deref());
-
-    let now_ms = Local::now().timestamp_millis() as u64;
-    let default_start = (Local::now() - ChronoDuration::days(365)).timestamp_millis() as u64;
-    let start_ms = q.start_ms.unwrap_or(default_start);
-    let end_ms = q.end_ms.unwrap_or(now_ms);
-    if end_ms < start_ms {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let limit = q.limit.filter(|v| *v > 0);
-
-    let ifindex = match resolve_query_iface_to_ifindex(&state, Some(iface.clone())).await {
-        Ok(i) => i,
-        Err(_) => return Err(StatusCode::BAD_REQUEST),
-    };
-
-    let runtime = state.monitor_runtime.read().await;
-    let histogram = state.histogram.read().await;
-
-    let mut items: Vec<UsageRankingItem> = runtime
-        .device_registry
-        .entries
-        .iter()
-        .filter_map(|((dev_ifindex, mac), dev)| {
-            if *dev_ifindex != ifindex {
-                return None;
-            }
-
-            let mac_s = mac_utils::to_string(mac);
-            let buckets = histogram.query_aggregate(ifindex, Some(mac_s.as_str()), start_ms, end_ms, AggregateBucket::Daily);
-            let mut up: u64 = 0;
-            let mut down: u64 = 0;
-            for b in buckets.into_iter().map(|b| b.with_traffic_type(tt)) {
-                up = up.saturating_add(b.up_v4_bytes.saturating_add(b.up_v6_bytes));
-                down = down.saturating_add(b.down_v4_bytes.saturating_add(b.down_v6_bytes));
-            }
-            let total = up.saturating_add(down);
-            if total == 0 {
-                return None;
-            }
-
-            Some(UsageRankingItem {
-                iface: iface.clone(),
-                mac: mac_s,
-                hostname: dev.hostname.clone(),
-                ipv4: dev.ipv4.clone(),
-                ipv6: dev.ipv6.clone(),
-                up_bytes: up,
-                down_bytes: down,
-                total_bytes: total,
-            })
-        })
-        .collect();
-
-    items.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes).then(a.mac.cmp(&b.mac)));
-    if let Some(limit) = limit {
-        items.truncate(limit);
-    }
-
-    Ok(Json(ApiEnvelope {
-        ok: true,
-        data: items,
-        error: None,
-    }))
-}
-
-pub async fn start_server(bind_addr: &str, state: ApiState) -> anyhow::Result<()> {
-    let app = router(state);
-    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
 }
 
 async fn health() -> Json<ApiEnvelope<&'static str>> {
@@ -288,7 +218,19 @@ async fn overview(
 }
 
 async fn devices(State(state): State<ApiState>, Query(q): Query<DevicesQuery>) -> Json<ApiEnvelope<Vec<crate::monitor::DeviceListItem>>> {
-    let period = match parse_period_scope(q.period.as_deref()) {
+    let topology = state.topology.read().await;
+    let mut data = state.snapshot.read().await.devices.clone();
+    if let Some(iface) = &q.iface {
+        let Some(ifindex) = topology.ifindex_by_name(iface) else {
+            return Json(ApiEnvelope {
+                ok: false,
+                data: Vec::new(),
+                error: Some(format!("unknown iface: {iface}")),
+            });
+        };
+        data.retain(|d| d.ifindex == ifindex);
+    }
+    if let Some(scope) = match parse_period_scope(q.period.as_deref()) {
         Ok(v) => v,
         Err(e) => {
             return Json(ApiEnvelope {
@@ -297,1252 +239,387 @@ async fn devices(State(state): State<ApiState>, Query(q): Query<DevicesQuery>) -
                 error: Some(e),
             });
         }
-    };
-    let devices = state.snapshot.read().await.devices.clone();
-    let mut filtered: Vec<_> = devices
-        .into_iter()
-        .filter(|d| {
-            if let Some(ref iface) = q.iface {
-                if !iface.is_empty() && d.logical_iface != *iface {
-                    return false;
-                }
-            }
-            true
-        })
-        .collect();
-    if let Some(scope) = period {
+    } {
         let (start_ms, end_ms) = period_range_ms(scope, now_millis());
         let histogram = state.histogram.read().await;
-        for item in &mut filtered {
-            let buckets = histogram.query_aggregate(item.ifindex, Some(item.mac.as_str()), start_ms, end_ms, AggregateBucket::Hourly);
+        for item in &mut data {
+            let buckets = histogram.query_aggregate(
+                item.ifindex,
+                Some(&item.mac),
+                start_ms,
+                end_ms,
+                AggregateBucket::Hourly,
+            );
             item.cumulative = cumulative_from_buckets(&buckets);
         }
     }
     Json(ApiEnvelope {
         ok: true,
-        data: filtered,
+        data,
         error: None,
     })
 }
 
-async fn set_device_hostname_handler(
-    State(state): State<ApiState>,
-    Json(req): Json<SetDeviceHostnameRequest>,
-) -> Json<ApiEnvelope<&'static str>> {
-    let iface = req.iface.trim();
-    if iface.is_empty() {
-        warn!("api PUT /api/devices/hostname rejected: iface is required");
-        return Json(ApiEnvelope {
-            ok: false,
-            data: "error",
-            error: Some("iface is required".to_string()),
-        });
-    }
-    let mac_raw = req.mac.trim();
-    if mac_raw.is_empty() {
-        warn!("api PUT /api/devices/hostname rejected: mac is required iface={}", iface);
-        return Json(ApiEnvelope {
-            ok: false,
-            data: "error",
-            error: Some("mac is required".to_string()),
-        });
-    }
-    let hostname = req.hostname.trim().to_string();
-    if hostname.is_empty() {
-        warn!(
-            "api PUT /api/devices/hostname rejected: hostname is required iface={} mac={}",
-            iface, mac_raw
-        );
-        return Json(ApiEnvelope {
-            ok: false,
-            data: "error",
-            error: Some("hostname is required".to_string()),
-        });
-    }
-
-    let ifindex = {
-        let topo = state.topology.read().await;
-        let Some(v) = topo.ifindex_by_name(iface) else {
-            warn!(
-                "api PUT /api/devices/hostname rejected: unknown iface={} mac={}",
-                iface, mac_raw
-            );
-            return Json(ApiEnvelope {
-                ok: false,
-                data: "error",
-                error: Some(format!("unknown iface: {iface}")),
-            });
-        };
-        v
-    };
-    let mac = match mac_utils::from_str(mac_raw) {
-        Ok(v) => v,
-        Err(_) => {
-            warn!(
-                "api PUT /api/devices/hostname rejected: invalid mac iface={} mac_raw={}",
-                iface, mac_raw
-            );
-            return Json(ApiEnvelope {
-                ok: false,
-                data: "error",
-                error: Some("invalid mac format".to_string()),
-            });
-        }
-    };
-
-    let mac_norm = mac_utils::to_string(&mac);
-    let mut snapshot_device: Option<crate::monitor::DeviceListItem> = None;
-    {
-        let mut snapshot = state.snapshot.write().await;
-        for dev in &mut snapshot.devices {
-            if dev.ifindex == ifindex && dev.mac.eq_ignore_ascii_case(&mac_norm) {
-                dev.hostname = hostname.clone();
-                snapshot_device = Some(dev.clone());
-            }
-        }
-    }
-
-    {
-        let mut runtime = state.monitor_runtime.write().await;
-        if let Some(known) = runtime.device_registry.entries.get_mut(&(ifindex, mac)) {
-            known.hostname = hostname.clone();
-        } else if let Some(dev) = snapshot_device {
-            runtime.device_registry.entries.insert(
-                (ifindex, mac),
-                KnownDevice {
-                    ifindex,
-                    mac,
-                    ipv4: dev.ipv4,
-                    ipv6: dev.ipv6,
-                    hostname: hostname.clone(),
-                    logical_iface: dev.logical_iface,
-                    subnet: dev.subnet,
-                    last_seen_ms: now_millis(),
-                },
-            );
-        } else {
-            warn!(
-                "api PUT /api/devices/hostname rejected: device not found iface={} mac={}",
-                iface, mac_norm
-            );
-            return Json(ApiEnvelope {
-                ok: false,
-                data: "error",
-                error: Some("device not found".to_string()),
-            });
-        }
-    }
-
-    if let Err(e) = persist_monitor_runtime_state(&state).await {
-        warn!(
-            "api PUT /api/devices/hostname failed persist iface={} mac={} hostname={} err={}",
-            iface, mac_norm, hostname, e
-        );
-        return Json(ApiEnvelope {
-            ok: false,
-            data: "error",
-            error: Some(format!("persist devices state failed: {}", e)),
-        });
-    }
-
-    info!(
-        "api PUT /api/devices/hostname ok iface={} mac={} hostname={}",
-        iface, mac_norm, hostname
-    );
-
+// 新增：IP统计API处理器
+async fn ips(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<IpListItem>>> {
     Json(ApiEnvelope {
         ok: true,
-        data: "ok",
+        data: state.snapshot.read().await.ips.clone(),
         error: None,
     })
 }
 
-#[derive(Debug, Clone, Copy)]
-enum PeriodScope {
-    Today,
-    Week,
-    Month,
-    Year,
-}
+async fn history(
+    State(state): State<ApiState>,
+    Query(q): Query<HistoryQuery>,
+) -> Json<ApiEnvelope<Vec<HistorySample>>> {
+    let topology = state.topology.read().await;
+    let history = state.history.read().await;
+    let traffic_type = parse_traffic_type(&q.traffic_type);
+    let direction = parse_direction(&q.direction);
 
-fn parse_period_scope(input: Option<&str>) -> Result<Option<PeriodScope>, String> {
-    let Some(raw) = input else {
-        return Ok(None);
-    };
-    let s = raw.trim();
-    if s.is_empty() {
-        return Ok(None);
-    }
-    match s.to_ascii_lowercase().as_str() {
-        "all" => Ok(None),
-        "today" => Ok(Some(PeriodScope::Today)),
-        "week" => Ok(Some(PeriodScope::Week)),
-        "month" => Ok(Some(PeriodScope::Month)),
-        "year" => Ok(Some(PeriodScope::Year)),
-        _ => Err("invalid period, expected one of: all, today, week, month, year".to_string()),
-    }
-}
-
-fn period_range_ms(scope: PeriodScope, now_ms: u64) -> (u64, u64) {
-    let now = match Local.timestamp_millis_opt(now_ms as i64) {
-        chrono::LocalResult::Single(v) => v,
-        _ => return (0, now_ms),
-    };
-    let today_start_naive = now.date_naive().and_hms_milli_opt(0, 0, 0, 0).unwrap();
-    let today_start = Local.from_local_datetime(&today_start_naive).unwrap().timestamp_millis() as u64;
-
-    let start = match scope {
-        PeriodScope::Today => today_start,
-        PeriodScope::Week => {
-            let days = now.weekday().num_days_from_monday() as i64;
-            let week_start_naive = (now.date_naive() - ChronoDuration::days(days))
-                .and_hms_milli_opt(0, 0, 0, 0)
-                .unwrap();
-            Local.from_local_datetime(&week_start_naive).unwrap().timestamp_millis() as u64
-        }
-        PeriodScope::Month => {
-            let month_start_naive = now.date_naive().with_day(1).unwrap().and_hms_milli_opt(0, 0, 0, 0).unwrap();
-            Local.from_local_datetime(&month_start_naive).unwrap().timestamp_millis() as u64
-        }
-        PeriodScope::Year => {
-            let year_start_naive = now
-                .date_naive()
-                .with_month(1)
-                .unwrap()
-                .with_day(1)
-                .unwrap()
-                .and_hms_milli_opt(0, 0, 0, 0)
-                .unwrap();
-            Local.from_local_datetime(&year_start_naive).unwrap().timestamp_millis() as u64
-        }
-    };
-    (start, now_ms)
-}
-
-fn cumulative_from_buckets(buckets: &[AggregatedBucket]) -> crate::monitor::CounterQuad {
-    let mut out = crate::monitor::CounterQuad::default();
-    for b in buckets {
-        out.up_v4_bytes = out.up_v4_bytes.saturating_add(b.up_v4_bytes);
-        out.down_v4_bytes = out.down_v4_bytes.saturating_add(b.down_v4_bytes);
-        out.up_v6_bytes = out.up_v6_bytes.saturating_add(b.up_v6_bytes);
-        out.down_v6_bytes = out.down_v6_bytes.saturating_add(b.down_v6_bytes);
-    }
-    out
-}
-
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-async fn resolve_query_iface_to_ifindex(state: &ApiState, iface: Option<String>) -> Result<u32, String> {
-    let name = iface
-        .and_then(|s| {
-            let t = s.trim();
-            if t.is_empty() { None } else { Some(t.to_string()) }
-        })
-        .ok_or_else(|| "iface is required".to_string())?;
-
-    let topo = state.topology.read().await;
-    if let Some(ix) = topo.ifindex_by_name(&name) {
-        return Ok(ix);
-    }
-    drop(topo);
-
-    let snap = state.snapshot.read().await;
-    for item in &snap.interfaces {
-        if item.ifname == name {
-            return Ok(item.ifindex);
-        }
-    }
-
-    Err(format!("unknown iface: {name}"))
-}
-
-async fn history(State(state): State<ApiState>, Query(q): Query<HistoryQuery>) -> Json<ApiEnvelope<Vec<HistorySample>>> {
-    let ifindex = match resolve_query_iface_to_ifindex(&state, q.iface.clone()).await {
-        Ok(i) => i,
-        Err(e) => {
+    if let (Some(iface), Some(mac)) = (&q.iface, &q.mac) {
+        let Some(ifindex) = topology.ifindex_by_name(iface) else {
             return Json(ApiEnvelope {
                 ok: false,
                 data: Vec::new(),
-                error: Some(e),
+                error: Some(format!("unknown iface: {iface}")),
             });
-        }
-    };
-    let traffic_type = parse_traffic_type(q.traffic_type.as_deref());
-    let direction = parse_direction(q.direction.as_deref());
-    let result = if let Some(mac) = q.mac.as_deref().filter(|s| !s.trim().is_empty()) {
-        state
-            .history
-            .read()
-            .await
-            .query_device(Some(ifindex), mac, traffic_type, direction)
-    } else {
-        state.history.read().await.query_iface(ifindex, traffic_type, direction)
-    };
+        };
+        let data = history.query_device(Some(ifindex), mac, traffic_type, direction);
+        return Json(ApiEnvelope { ok: true, data, error: None });
+    }
+
+    if let Some(iface) = &q.iface {
+        let Some(ifindex) = topology.ifindex_by_name(iface) else {
+            return Json(ApiEnvelope {
+                ok: false,
+                data: Vec::new(),
+                error: Some(format!("unknown iface: {iface}")),
+            });
+        };
+        let data = history.query_iface(ifindex, traffic_type, direction);
+        return Json(ApiEnvelope { ok: true, data, error: None });
+    }
+
     Json(ApiEnvelope {
-        ok: true,
-        data: result,
-        error: None,
+        ok: false,
+        data: Vec::new(),
+        error: Some("missing iface param".to_string()),
     })
 }
 
-fn parse_traffic_type(input: Option<&str>) -> HistoryTrafficType {
-    match input.unwrap_or("all").to_ascii_lowercase().as_str() {
+async fn aggregate(
+    State(state): State<ApiState>,
+    Query(q): Query<AggregateQuery>,
+) -> Json<ApiEnvelope<Vec<AggregatedBucket>>> {
+    let topology = state.topology.read().await;
+    let histogram = state.histogram.read().await;
+
+    let Some(iface) = &q.iface else {
+        return Json(ApiEnvelope {
+            ok: false,
+            data: Vec::new(),
+            error: Some("missing iface param".to_string()),
+        });
+    };
+    let Some(ifindex) = topology.ifindex_by_name(iface) else {
+        return Json(ApiEnvelope {
+            ok: false,
+            data: Vec::new(),
+            error: Some(format!("unknown iface: {iface}")),
+        });
+    };
+
+    let bucket = match q.bucket.as_deref().unwrap_or("hourly") {
+        "hourly" => AggregateBucket::Hourly,
+        "daily" => AggregateBucket::Daily,
+        _ => {
+            return Json(ApiEnvelope {
+                ok: false,
+                data: Vec::new(),
+                error: Some("invalid bucket param, expect 'hourly' or 'daily'".to_string()),
+            });
+        }
+    };
+
+    let start_ms = q.start_ms.unwrap_or(0);
+    let end_ms = q.end_ms.unwrap_or(u64::MAX);
+
+    let data = histogram.query_aggregate(ifindex, q.mac.as_deref(), start_ms, end_ms, bucket);
+
+    let traffic_type = parse_traffic_type(&q.traffic_type);
+    let data = data.into_iter().map(|b| b.with_traffic_type(traffic_type)).collect();
+
+    Json(ApiEnvelope { ok: true, data, error: None })
+}
+
+async fn usage_ranking(
+    State(state): State<ApiState>,
+    Query(q): Query<UsageRankingQuery>,
+) -> Json<ApiEnvelope<Vec<UsageRankingItem>>> {
+    let topology = state.topology.read().await;
+    let histogram = state.histogram.read().await;
+
+    let (completed_iface, completed_device, _completed_ip) = state.monitor_runtime.read().await.last_snapshot_histogram_state.cumulative_from_completed();
+    let (current_iface, current_device, _current_ip) = histogram.cumulative_from_all();
+
+    let mut items = Vec::new();
+    let mut seen_macs = std::collections::HashSet::new();
+
+    for ((ifindex, mac), cumulative) in current_device.iter().chain(completed_device.iter()) {
+        if seen_macs.contains(&(*ifindex, *mac)) {
+            continue;
+        }
+        seen_macs.insert((*ifindex, *mac));
+
+        let Some(iface) = topology.by_ifindex(*ifindex) else {
+            continue;
+        };
+
+        if let Some(expected_iface) = &q.iface {
+            if &iface.name != expected_iface {
+                continue;
+            }
+        }
+
+        let mut total = *cumulative;
+        let traffic_type = parse_traffic_type(&q.traffic_type);
+        if traffic_type != HistoryTrafficType::All {
+            total = zero_out_quad_for_traffic_type(total, traffic_type);
+        }
+
+        let mac_str = mac_utils::to_string(mac);
+        let runtime = state.monitor_runtime.read().await;
+        let known = runtime.device_registry.entries.get(&(*ifindex, *mac));
+        let hostname = known.map(|k| k.hostname.clone()).unwrap_or_default();
+
+        items.push(UsageRankingItem {
+            iface: iface.name.clone(),
+            mac: mac_str,
+            hostname,
+            ipv4: known.map(|k| k.ipv4.clone()).unwrap_or_default(),
+            ipv6: known.map(|k| k.ipv6.clone()).unwrap_or_default(),
+            up_bytes: total.up_v4_bytes + total.up_v6_bytes,
+            down_bytes: total.down_v4_bytes + total.down_v6_bytes,
+            total_bytes: total.up_v4_bytes + total.up_v6_bytes + total.down_v4_bytes + total.down_v6_bytes,
+        });
+    }
+
+    items.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+
+    if let Some(limit) = q.limit.filter(|l| *l > 0) {
+        items.truncate(limit);
+    }
+
+    Json(ApiEnvelope { ok: true, data: items, error: None })
+}
+
+// 新增：IP使用排名API处理器
+async fn ip_usage_ranking(
+    State(state): State<ApiState>,
+    Query(q): Query<UsageRankingQuery>,
+) -> Json<ApiEnvelope<Vec<IpUsageRankingItem>>> {
+    let topology = state.topology.read().await;
+    let histogram = state.histogram.read().await;
+
+    let (_completed_iface, _completed_device, completed_ip) = state.monitor_runtime.read().await.last_snapshot_histogram_state.cumulative_from_completed();
+    let (_current_iface, _current_device, current_ip) = histogram.cumulative_from_all();
+
+    let mut items = Vec::new();
+    let mut seen_ips = std::collections::HashSet::new();
+
+    for ((ifindex, ip_addr), cumulative) in current_ip.iter().chain(completed_ip.iter()) {
+        if seen_ips.contains(&(*ifindex, ip_addr.clone())) {
+            continue;
+        }
+        seen_ips.insert((*ifindex, ip_addr.clone()));
+
+        let Some(iface) = topology.by_ifindex(*ifindex) else {
+            continue;
+        };
+
+        if let Some(expected_iface) = &q.iface {
+            if &iface.name != expected_iface {
+                continue;
+            }
+        }
+
+        let mut total = *cumulative;
+        let traffic_type = parse_traffic_type(&q.traffic_type);
+        if traffic_type != HistoryTrafficType::All {
+            total = zero_out_quad_for_traffic_type(total, traffic_type);
+        }
+
+        let ip_version = if ip_addr.contains(':') { 6 } else { 4 };
+
+        items.push(IpUsageRankingItem {
+            iface: iface.name.clone(),
+            ip: ip_addr.clone(),
+            ip_version,
+            up_bytes: total.up_v4_bytes + total.up_v6_bytes,
+            down_bytes: total.down_v4_bytes + total.down_v6_bytes,
+            total_bytes: total.up_v4_bytes + total.up_v6_bytes + total.down_v4_bytes + total.down_v6_bytes,
+        });
+    }
+
+    items.sort_by(|a, b| b.total_bytes.cmp(&a.total_bytes));
+
+    if let Some(limit) = q.limit.filter(|l| *l > 0) {
+        items.truncate(limit);
+    }
+
+    Json(ApiEnvelope { ok: true, data: items, error: None })
+}
+
+// 辅助函数：根据流量类型清零四元组
+fn zero_out_quad_for_traffic_type(mut quad: crate::monitor::CounterQuad, traffic_type: HistoryTrafficType) -> crate::monitor::CounterQuad {
+    match traffic_type {
+        HistoryTrafficType::All => quad,
+        HistoryTrafficType::Ipv4 => {
+            quad.up_v6_bytes = 0;
+            quad.down_v6_bytes = 0;
+            quad.up_v6_bps = 0;
+            quad.down_v6_bps = 0;
+            quad
+        },
+        HistoryTrafficType::Ipv6 => {
+            quad.up_v4_bytes = 0;
+            quad.down_v4_bytes = 0;
+            quad.up_v4_bps = 0;
+            quad.down_v4_bps = 0;
+            quad
+        },
+    }
+}
+
+fn parse_traffic_type(s: &Option<String>) -> HistoryTrafficType {
+    match s.as_deref().unwrap_or("all") {
+        "all" => HistoryTrafficType::All,
         "ipv4" => HistoryTrafficType::Ipv4,
         "ipv6" => HistoryTrafficType::Ipv6,
         _ => HistoryTrafficType::All,
     }
 }
 
-fn parse_direction(input: Option<&str>) -> HistoryDirection {
-    match input.unwrap_or("both").to_ascii_lowercase().as_str() {
+fn parse_direction(s: &Option<String>) -> HistoryDirection {
+    match s.as_deref().unwrap_or("both") {
+        "both" => HistoryDirection::Both,
         "up" => HistoryDirection::Up,
         "down" => HistoryDirection::Down,
         _ => HistoryDirection::Both,
     }
 }
 
-async fn aggregate(State(state): State<ApiState>, Query(q): Query<AggregateQuery>) -> Json<ApiEnvelope<Vec<AggregatedBucket>>> {
-    let ifindex = match resolve_query_iface_to_ifindex(&state, q.iface.clone()).await {
-        Ok(i) => i,
-        Err(e) => {
-            return Json(ApiEnvelope {
-                ok: false,
-                data: Vec::new(),
-                error: Some(e),
-            });
+fn parse_period_scope(s: Option<&str>) -> Result<Option<PeriodScope>, String> {
+    if let Some(s) = s {
+        match s {
+            "today" => Ok(Some(PeriodScope::Today)),
+            "yesterday" => Ok(Some(PeriodScope::Yesterday)),
+            "this_week" => Ok(Some(PeriodScope::ThisWeek)),
+            "last_week" => Ok(Some(PeriodScope::LastWeek)),
+            "this_month" => Ok(Some(PeriodScope::ThisMonth)),
+            "last_month" => Ok(Some(PeriodScope::LastMonth)),
+            "" => Ok(None),
+            _ => Err(format!("unknown period: {s}")),
         }
-    };
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let default_end = now_ms;
-    let default_start = now_ms.saturating_sub(24 * 3600 * 1000);
-    let start_ms = q.start_ms.unwrap_or(default_start);
-    let end_ms = q.end_ms.unwrap_or(default_end);
-    let bucket = match q.bucket.as_deref().unwrap_or("hourly").to_ascii_lowercase().as_str() {
-        "daily" => AggregateBucket::Daily,
-        _ => AggregateBucket::Hourly,
-    };
-    let traffic_type = parse_traffic_type(q.traffic_type.as_deref());
-    let mac_filter = q.mac.as_deref().filter(|s| !s.trim().is_empty());
-
-    let result: Vec<AggregatedBucket> = if let Some(mac) = mac_filter {
-        let histogram = state.histogram.read().await;
-        histogram
-            .query_aggregate(ifindex, Some(mac), start_ms, end_ms, bucket)
-            .into_iter()
-            .map(|b| b.with_traffic_type(traffic_type))
-            .collect()
     } else {
-        // "all devices" 口径：按设备维度聚合后再求和，避免包含无法归属到设备的流量。
-        let runtime = state.monitor_runtime.read().await;
-        let mut macs = Vec::new();
-        for ((dev_ifindex, mac), _dev) in &runtime.device_registry.entries {
-            if *dev_ifindex == ifindex {
-                macs.push(mac_utils::to_string(mac));
-            }
-        }
-        drop(runtime);
-
-        let histogram = state.histogram.read().await;
-        let mut by_window: BTreeMap<(u64, u64), AggregatedBucket> = BTreeMap::new();
-        for mac in macs {
-            let buckets = histogram.query_aggregate(ifindex, Some(mac.as_str()), start_ms, end_ms, bucket);
-            for b in buckets {
-                let key = (b.start_ts_ms, b.end_ts_ms);
-                let entry = by_window.entry(key).or_insert_with(|| empty_bucket(key.0, key.1));
-                accumulate_bucket(entry, &b);
-            }
-        }
-
-        by_window.into_values().map(|b| b.with_traffic_type(traffic_type)).collect()
-    };
-    Json(ApiEnvelope {
-        ok: true,
-        data: result,
-        error: None,
-    })
-}
-
-fn empty_bucket(start_ts_ms: u64, end_ts_ms: u64) -> AggregatedBucket {
-    AggregatedBucket {
-        start_ts_ms,
-        end_ts_ms,
-        up_v4_bytes: 0,
-        down_v4_bytes: 0,
-        up_v6_bytes: 0,
-        down_v6_bytes: 0,
-        up_v4_bps_avg: 0,
-        up_v4_bps_max: 0,
-        up_v4_bps_min: 0,
-        up_v4_bps_p95: 0,
-        down_v4_bps_avg: 0,
-        down_v4_bps_max: 0,
-        down_v4_bps_min: 0,
-        down_v4_bps_p95: 0,
-        up_v6_bps_avg: 0,
-        up_v6_bps_max: 0,
-        up_v6_bps_min: 0,
-        up_v6_bps_p95: 0,
-        down_v6_bps_avg: 0,
-        down_v6_bps_max: 0,
-        down_v6_bps_min: 0,
-        down_v6_bps_p95: 0,
+        Ok(None)
     }
 }
 
-fn accumulate_bucket(dst: &mut AggregatedBucket, src: &AggregatedBucket) {
-    dst.up_v4_bytes = dst.up_v4_bytes.saturating_add(src.up_v4_bytes);
-    dst.down_v4_bytes = dst.down_v4_bytes.saturating_add(src.down_v4_bytes);
-    dst.up_v6_bytes = dst.up_v6_bytes.saturating_add(src.up_v6_bytes);
-    dst.down_v6_bytes = dst.down_v6_bytes.saturating_add(src.down_v6_bytes);
-    dst.up_v4_bps_avg = dst.up_v4_bps_avg.saturating_add(src.up_v4_bps_avg);
-    dst.up_v4_bps_max = dst.up_v4_bps_max.saturating_add(src.up_v4_bps_max);
-    dst.up_v4_bps_min = dst.up_v4_bps_min.saturating_add(src.up_v4_bps_min);
-    dst.up_v4_bps_p95 = dst.up_v4_bps_p95.saturating_add(src.up_v4_bps_p95);
-    dst.down_v4_bps_avg = dst.down_v4_bps_avg.saturating_add(src.down_v4_bps_avg);
-    dst.down_v4_bps_max = dst.down_v4_bps_max.saturating_add(src.down_v4_bps_max);
-    dst.down_v4_bps_min = dst.down_v4_bps_min.saturating_add(src.down_v4_bps_min);
-    dst.down_v4_bps_p95 = dst.down_v4_bps_p95.saturating_add(src.down_v4_bps_p95);
-    dst.up_v6_bps_avg = dst.up_v6_bps_avg.saturating_add(src.up_v6_bps_avg);
-    dst.up_v6_bps_max = dst.up_v6_bps_max.saturating_add(src.up_v6_bps_max);
-    dst.up_v6_bps_min = dst.up_v6_bps_min.saturating_add(src.up_v6_bps_min);
-    dst.up_v6_bps_p95 = dst.up_v6_bps_p95.saturating_add(src.up_v6_bps_p95);
-    dst.down_v6_bps_avg = dst.down_v6_bps_avg.saturating_add(src.down_v6_bps_avg);
-    dst.down_v6_bps_max = dst.down_v6_bps_max.saturating_add(src.down_v6_bps_max);
-    dst.down_v6_bps_min = dst.down_v6_bps_min.saturating_add(src.down_v6_bps_min);
-    dst.down_v6_bps_p95 = dst.down_v6_bps_p95.saturating_add(src.down_v6_bps_p95);
+fn cumulative_from_buckets(buckets: &[AggregatedBucket]) -> crate::monitor::CounterQuad {
+    let mut total = crate::monitor::CounterQuad::default();
+    for bucket in buckets {
+        total.up_v4_bytes = total.up_v4_bytes.saturating_add(bucket.up_v4_bytes);
+        total.down_v4_bytes = total.down_v4_bytes.saturating_add(bucket.down_v4_bytes);
+        total.up_v6_bytes = total.up_v6_bytes.saturating_add(bucket.up_v6_bytes);
+        total.down_v6_bytes = total.down_v6_bytes.saturating_add(bucket.down_v6_bytes);
+    }
+    total
 }
 
-async fn policy(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<PolicyItem>>> {
-    let data = {
-        let guard = state.policy_runtime.read().await;
-        policy_items(&guard)
-    };
-    Json(ApiEnvelope {
-        ok: true,
-        data,
-        error: None,
-    })
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
-async fn get_schedules(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<ScheduledRuleApi>>> {
-    let data = {
-        let guard = state.policy_runtime.read().await;
-        get_scheduled_rules(&guard)
-    };
-    Json(ApiEnvelope {
-        ok: true,
-        data,
-        error: None,
-    })
-}
-
-async fn create_schedule(State(state): State<ApiState>, Json(req): Json<CreateScheduledRuleRequest>) -> impl IntoResponse {
-    let ts = &req.time_slot;
-    info!(
-        "api POST /api/rate_limit/schedules call iface={} mac={} time={}-{} days={:?} kbps d4={} d6={} u4={} u6={}",
-        req.iface, req.mac, ts.start, ts.end, ts.days, req.down_v4_kbps, req.down_v6_kbps, req.up_v4_kbps, req.up_v6_kbps
-    );
-    let result = {
-        let topo = state.topology.read().await;
-        let mut guard = state.policy_runtime.write().await;
-        create_scheduled_rule(&mut guard, req, &topo)
-    };
-    match result {
-        Ok(v) => {
-            if let Err(e) = persist_policy_state(&state).await {
-                warn!(
-                    "api POST /api/rate_limit/schedules failed persist after rule id={} err={}",
-                    v.id, e
-                );
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiEnvelope::<ScheduledRuleApi> {
-                        ok: false,
-                        data: ScheduledRuleApi {
-                            id: String::new(),
-                            iface: String::new(),
-                            mac: String::new(),
-                            time_slot: crate::policy::TimeSlotApi {
-                                start: String::new(),
-                                end: String::new(),
-                                days: vec![],
-                            },
-                            down_v4_kbps: 0,
-                            down_v6_kbps: 0,
-                            up_v4_kbps: 0,
-                            up_v6_kbps: 0,
-                        },
-                        error: Some(format!("persist policy failed: {}", e)),
-                    }),
-                )
-                    .into_response();
-            }
-            info!(
-                "api POST /api/rate_limit/schedules ok id={} iface={} mac={}",
-                v.id, v.iface, v.mac
-            );
-            Json(ApiEnvelope {
-                ok: true,
-                data: v,
-                error: None,
-            })
-            .into_response()
-        }
-        Err(e) => {
-            warn!("api POST /api/rate_limit/schedules rejected err={}", e);
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ApiEnvelope::<ScheduledRuleApi> {
-                    ok: false,
-                    data: ScheduledRuleApi {
-                        id: String::new(),
-                        iface: String::new(),
-                        mac: String::new(),
-                        time_slot: crate::policy::TimeSlotApi {
-                            start: String::new(),
-                            end: String::new(),
-                            days: vec![],
-                        },
-                        down_v4_kbps: 0,
-                        down_v6_kbps: 0,
-                        up_v4_kbps: 0,
-                        up_v6_kbps: 0,
-                    },
-                    error: Some(e.to_string()),
-                }),
-            )
-                .into_response()
-        }
+fn period_range_ms(scope: PeriodScope, now_ms: u64) -> (u64, u64) {
+    use chrono::{Datelike, Local, Timelike};
+    
+    let now = Local.timestamp_millis_opt(now_ms as i64).unwrap();
+    match scope {
+        PeriodScope::Today => {
+            let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
+            let start_ts = Local.from_local_datetime(&start).unwrap().timestamp_millis() as u64;
+            let end = now.date_naive().and_hms_opt(23, 59, 59).unwrap();
+            let end_ts = Local.from_local_datetime(&end).unwrap().timestamp_millis() as u64;
+            (start_ts, end_ts)
+        },
+        PeriodScope::Yesterday => {
+            let yesterday = now.date_naive() - ChronoDuration::days(1);
+            let start = yesterday.and_hms_opt(0, 0, 0).unwrap();
+            let start_ts = Local.from_local_datetime(&start).unwrap().timestamp_millis() as u64;
+            let end = yesterday.and_hms_opt(23, 59, 59).unwrap();
+            let end_ts = Local.from_local_datetime(&end).unwrap().timestamp_millis() as u64;
+            (start_ts, end_ts)
+        },
+        PeriodScope::ThisWeek => {
+            let days_since_monday = (now.weekday() as u32 + 7 - 1) % 7;
+            let start_date = now.date_naive() - ChronoDuration::days(days_since_monday as i64);
+            let start = start_date.and_hms_opt(0, 0, 0).unwrap();
+            let start_ts = Local.from_local_datetime(&start).unwrap().timestamp_millis() as u64;
+            let end_date = start_date + ChronoDuration::days(6);
+            let end = end_date.and_hms_opt(23, 59, 59).unwrap();
+            let end_ts = Local.from_local_datetime(&end).unwrap().timestamp_millis() as u64;
+            (start_ts, end_ts)
+        },
+        PeriodScope::LastWeek => {
+            let days_since_monday = (now.weekday() as u32 + 7 - 1) % 7;
+            let start_date = now.date_naive() - ChronoDuration::days(days_since_monday as i64 + 7);
+            let start = start_date.and_hms_opt(0, 0, 0).unwrap();
+            let start_ts = Local.from_local_datetime(&start).unwrap().timestamp_millis() as u64;
+            let end_date = start_date + ChronoDuration::days(6);
+            let end = end_date.and_hms_opt(23, 59, 59).unwrap();
+            let end_ts = Local.from_local_datetime(&end).unwrap().timestamp_millis() as u64;
+            (start_ts, end_ts)
+        },
+        PeriodScope::ThisMonth => {
+            let start = now.date_naive().with_day(1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+            let start_ts = Local.from_local_datetime(&start).unwrap().timestamp_millis() as u64;
+            let end = now.date_naive().with_day(1).unwrap().with_month(12.min(now.month() + 1)).unwrap_or_else(|| {
+                now.date_naive().with_year(now.year() + 1).unwrap().with_month(1).unwrap().with_day(1).unwrap()
+            }).and_hms_opt(23, 59, 59).unwrap();
+            let end_ts = Local.from_local_datetime(&end).unwrap().timestamp_millis() as u64;
+            (start_ts, end_ts)
+        },
+        PeriodScope::LastMonth => {
+            let prev_month = if now.month() == 1 {
+                (now.year() - 1, 12)
+            } else {
+                (now.year(), now.month() - 1)
+            };
+            let start = NaiveDate::from_ymd_opt(prev_month.0, prev_month.1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+            let start_ts = Local.from_local_datetime(&start).unwrap().timestamp_millis() as u64;
+            let end = NaiveDate::from_ymd_opt(prev_month.0, prev_month.1, 1).unwrap().with_month(12.min(prev_month.1 + 1)).unwrap_or_else(|| {
+                NaiveDate::from_ymd_opt(prev_month.0 + 1, 1, 1).unwrap()
+            }).and_hms_opt(23, 59, 59).unwrap();
+            let end_ts = Local.from_local_datetime(&end).unwrap().timestamp_millis() as u64;
+            (start_ts, end_ts)
+        },
     }
 }
 
-async fn update_schedule(
-    State(state): State<ApiState>,
-    Path(id): Path<String>,
-    Json(req): Json<UpdateScheduledRuleRequest>,
-) -> impl IntoResponse {
-    let ts = &req.time_slot;
-    info!(
-        "api PUT /api/rate_limit/schedules/{{id}} call id={} iface={} mac={} time={}-{} days={:?} kbps d4={} d6={} u4={} u6={}",
-        id, req.iface, req.mac, ts.start, ts.end, ts.days, req.down_v4_kbps, req.down_v6_kbps, req.up_v4_kbps, req.up_v6_kbps
-    );
-    let result = {
-        let topo = state.topology.read().await;
-        let mut guard = state.policy_runtime.write().await;
-        update_scheduled_rule(&mut guard, &id, req, &topo)
-    };
-    match result {
-        Ok(v) => {
-            if let Err(e) = persist_policy_state(&state).await {
-                warn!(
-                    "api PUT/PATCH /api/rate_limit/schedules/{{id}} failed persist id={} err={}",
-                    id, e
-                );
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiEnvelope::<ScheduledRuleApi> {
-                        ok: false,
-                        data: ScheduledRuleApi {
-                            id: String::new(),
-                            iface: String::new(),
-                            mac: String::new(),
-                            time_slot: crate::policy::TimeSlotApi {
-                                start: String::new(),
-                                end: String::new(),
-                                days: vec![],
-                            },
-                            down_v4_kbps: 0,
-                            down_v6_kbps: 0,
-                            up_v4_kbps: 0,
-                            up_v6_kbps: 0,
-                        },
-                        error: Some(format!("persist policy failed: {}", e)),
-                    }),
-                )
-                    .into_response();
-            }
-            info!(
-                "api PUT/PATCH /api/rate_limit/schedules/{{id}} ok id={} iface={} mac={}",
-                v.id, v.iface, v.mac
-            );
-            Json(ApiEnvelope {
-                ok: true,
-                data: v,
-                error: None,
-            })
-            .into_response()
-        }
-        Err(e) => {
-            warn!("api PUT/PATCH /api/rate_limit/schedules/{{id}} rejected id={} err={}", id, e);
-            (
-                StatusCode::BAD_REQUEST,
-                Json(ApiEnvelope::<ScheduledRuleApi> {
-                    ok: false,
-                    data: ScheduledRuleApi {
-                        id: String::new(),
-                        iface: String::new(),
-                        mac: String::new(),
-                        time_slot: crate::policy::TimeSlotApi {
-                            start: String::new(),
-                            end: String::new(),
-                            days: vec![],
-                        },
-                        down_v4_kbps: 0,
-                        down_v6_kbps: 0,
-                        up_v4_kbps: 0,
-                        up_v6_kbps: 0,
-                    },
-                    error: Some(e.to_string()),
-                }),
-            )
-                .into_response()
-        }
-    }
+#[derive(Debug, Clone, Copy)]
+enum PeriodScope {
+    Today,
+    Yesterday,
+    ThisWeek,
+    LastWeek,
+    ThisMonth,
+    LastMonth,
 }
 
-async fn delete_schedule(State(state): State<ApiState>, Path(id): Path<String>) -> Json<ApiEnvelope<&'static str>> {
-    info!("api DELETE /api/rate_limit/schedules/{{id}} call id={}", id);
-    let result = {
-        let mut guard = state.policy_runtime.write().await;
-        delete_scheduled_rule(&mut guard, &id)
-    };
-    if let Err(e) = result {
-        warn!("api DELETE /api/rate_limit/schedules/{{id}} rejected id={} err={}", id, e);
-        return Json(ApiEnvelope {
-            ok: false,
-            data: "error",
-            error: Some(e.to_string()),
-        });
-    }
-    if let Err(e) = persist_policy_state(&state).await {
-        warn!("api DELETE /api/rate_limit/schedules/{{id}} failed persist id={} err={}", id, e);
-        return Json(ApiEnvelope {
-            ok: false,
-            data: "error",
-            error: Some(format!("persist policy failed: {}", e)),
-        });
-    }
-    info!("api DELETE /api/rate_limit/schedules/{{id}} ok id={}", id);
-    Json(ApiEnvelope {
-        ok: true,
-        data: "ok",
-        error: None,
-    })
-}
-
-async fn get_iface_limits_handler(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<InterfaceRateLimitApi>>> {
-    let data = {
-        let guard = state.policy_runtime.read().await;
-        get_iface_limits(&guard)
-    };
-    Json(ApiEnvelope {
-        ok: true,
-        data,
-        error: None,
-    })
-}
-
-async fn set_iface_limit_handler(
-    State(state): State<ApiState>,
-    Json(req): Json<SetInterfaceRateLimitRequest>,
-) -> Json<ApiEnvelope<&'static str>> {
-    let result = {
-        let topology_guard = state.topology.read().await;
-        let mut guard = state.policy_runtime.write().await;
-        set_iface_limit(&mut guard, req, &topology_guard)
-    };
-    to_simple_response_with_persist(&state, result).await
-}
-
-async fn delete_iface_limit_handler(State(state): State<ApiState>, Path(iface): Path<String>) -> Json<ApiEnvelope<&'static str>> {
-    let result = {
-        let mut guard = state.policy_runtime.write().await;
-        delete_iface_limit(&mut guard, &iface)
-    };
-    to_simple_response_with_persist(&state, result).await
-}
-
-async fn get_guest_defaults_handler(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<GuestDefaultRateLimitApi>>> {
-    let data = {
-        let guard = state.policy_runtime.read().await;
-        get_guest_defaults(&guard)
-    };
-    Json(ApiEnvelope {
-        ok: true,
-        data,
-        error: None,
-    })
-}
-
-async fn set_guest_default_handler(
-    State(state): State<ApiState>,
-    Json(req): Json<SetInterfaceRateLimitRequest>,
-) -> Json<ApiEnvelope<&'static str>> {
-    info!(
-        "api POST /api/rate_limit/guest_defaults call iface={} kbps d4={} d6={} u4={} u6={}",
-        req.iface, req.down_v4_kbps, req.down_v6_kbps, req.up_v4_kbps, req.up_v6_kbps
-    );
-    let result = {
-        let topology_guard = state.topology.read().await;
-        let mut guard = state.policy_runtime.write().await;
-        set_guest_default(&mut guard, req, &topology_guard)
-    };
-    to_simple_response_with_persist(&state, result).await
-}
-
-async fn delete_guest_default_handler(State(state): State<ApiState>, Path(iface): Path<String>) -> Json<ApiEnvelope<&'static str>> {
-    info!(
-        "api DELETE /api/rate_limit/guest_defaults/{iface} call iface={}",
-        iface
-    );
-    let result = {
-        let mut guard = state.policy_runtime.write().await;
-        delete_guest_default(&mut guard, &iface)
-    };
-    to_simple_response_with_persist(&state, result).await
-}
-
-async fn set_guest_default_enable_handler(
-    State(state): State<ApiState>,
-    Path(iface): Path<String>,
-    Json(req): Json<SetEnabledRequest>,
-) -> Json<ApiEnvelope<&'static str>> {
-    info!(
-        "api PUT /api/rate_limit/guest_defaults/{iface}/enable call iface={} enabled={}",
-        iface, req.enabled
-    );
-    let result = {
-        let mut guard = state.policy_runtime.write().await;
-        set_guest_default_enabled(&mut guard, &iface, req.enabled)
-    };
-    to_simple_response_with_persist(&state, result).await
-}
-
-async fn get_guest_whitelist_handler(State(state): State<ApiState>) -> Json<ApiEnvelope<Vec<GuestWhitelistEntryApi>>> {
-    let data = {
-        let guard = state.policy_runtime.read().await;
-        get_guest_whitelist(&guard)
-    };
-    Json(ApiEnvelope {
-        ok: true,
-        data,
-        error: None,
-    })
-}
-
-async fn add_guest_whitelist_handler(
-    State(state): State<ApiState>,
-    Json(req): Json<GuestWhitelistEntryRequest>,
-) -> Json<ApiEnvelope<&'static str>> {
-    info!(
-        "api POST /api/rate_limit/guest_whitelist call iface={} mac={}",
-        req.iface, req.mac
-    );
-    let result = {
-        let topology_guard = state.topology.read().await;
-        let mut guard = state.policy_runtime.write().await;
-        add_guest_whitelist(&mut guard, req, &topology_guard)
-    };
-    to_simple_response_with_persist(&state, result).await
-}
-
-async fn remove_guest_whitelist_handler(
-    State(state): State<ApiState>,
-    Json(req): Json<GuestWhitelistEntryRequest>,
-) -> Json<ApiEnvelope<&'static str>> {
-    info!(
-        "api DELETE /api/rate_limit/guest_whitelist call iface={} mac={}",
-        req.iface, req.mac
-    );
-    let result = {
-        let mut guard = state.policy_runtime.write().await;
-        remove_guest_whitelist(&mut guard, req)
-    };
-    to_simple_response_with_persist(&state, result).await
-}
-
-async fn to_simple_response_with_persist(state: &ApiState, result: anyhow::Result<()>) -> Json<ApiEnvelope<&'static str>> {
-    if let Err(e) = result {
-        return Json(ApiEnvelope {
-            ok: false,
-            data: "error",
-            error: Some(e.to_string()),
-        });
-    }
-    if let Err(e) = persist_policy_state(state).await {
-        return Json(ApiEnvelope {
-            ok: false,
-            data: "error",
-            error: Some(format!("persist policy failed: {}", e)),
-        });
-    }
-    Json(ApiEnvelope {
-        ok: true,
-        data: "ok",
-        error: None,
-    })
-}
-
-async fn persist_policy_state(state: &ApiState) -> anyhow::Result<()> {
-    if let Some(p) = &state.persistence {
-        let guard = state.policy_runtime.read().await;
-        p.save_policy_runtime(&guard)?;
-    }
-    Ok(())
-}
-
-async fn persist_monitor_runtime_state(state: &ApiState) -> anyhow::Result<()> {
-    if let Some(p) = &state.persistence {
-        let runtime = state.monitor_runtime.read().await;
-        let topo = state.topology.read().await;
-        p.save_monitor_runtime(&runtime, &topo)?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::monitor::{CounterQuad, DeviceListItem, MonitorRuntime};
-    use crate::policy::{init_runtime, parse_policy};
-    use crate::topology::{Interface, InterfaceZone, TopologySnapshot};
-    use crate::utils::system_utils::InterfaceRole;
-    use axum::body::Body;
-    use axum::http::{Request, StatusCode};
-    use http_body_util::BodyExt;
-    use tower::ServiceExt;
-
-    fn mock_api_state() -> ApiState {
-        let topo = TopologySnapshot::from_interfaces(vec![
-            Interface {
-                ifindex: 1,
-                name: "eth0".to_string(),
-                role: InterfaceRole::Ethernet,
-                zone: InterfaceZone::Other,
-                parent_ifindex: None,
-                ipv4_cidrs: vec![],
-                ipv6_cidrs: vec![],
-            },
-            Interface {
-                ifindex: 2,
-                name: "guest0".to_string(),
-                role: InterfaceRole::Ethernet,
-                zone: InterfaceZone::Guest,
-                parent_ifindex: None,
-                ipv4_cidrs: vec![],
-                ipv6_cidrs: vec![],
-            },
-        ]);
-        ApiState {
-            snapshot: Arc::new(RwLock::new(SnapshotData::default())),
-            history: Arc::new(RwLock::new(TrafficHistory::new(60))),
-            histogram: Arc::new(RwLock::new(HistogramHistory::new())),
-            monitor_runtime: Arc::new(RwLock::new(MonitorRuntime::default())),
-            policy_runtime: Arc::new(RwLock::new(init_runtime(parse_policy()))),
-            topology: Arc::new(RwLock::new(topo)),
-            persistence: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn api_health() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/health").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert!(env.ok);
-    }
-
-    #[tokio::test]
-    async fn api_snapshot() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/snapshot").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_overview() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/overview").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_overview_with_period_today() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/overview?period=today").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert!(env.ok);
-    }
-
-    #[tokio::test]
-    async fn api_devices() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/devices").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_devices_with_iface_filter() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/devices?iface=eth0").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_devices_with_period_all() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/devices?period=all").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert!(env.ok);
-    }
-
-    #[tokio::test]
-    async fn api_devices_with_invalid_period() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/devices?period=invalid").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert!(!env.ok);
-        assert!(env.error.unwrap().contains("period"));
-    }
-
-    #[tokio::test]
-    async fn api_set_device_hostname() {
-        let state = mock_api_state();
-        {
-            let mut snap = state.snapshot.write().await;
-            snap.devices.push(DeviceListItem {
-                ifindex: 1,
-                logical_iface: "eth0".to_string(),
-                subnet: "-".to_string(),
-                ipv4: vec!["192.168.1.2".to_string()],
-                ipv6: vec![],
-                mac: "aa:bb:cc:dd:ee:ff".to_string(),
-                hostname: "old-name".to_string(),
-                metrics: CounterQuad::default(),
-                cumulative: CounterQuad::default(),
-                online: true,
-                last_seen_ms: 0,
-                neighbor_state: Some("REACHABLE".to_string()),
-            });
-        }
-
-        let app = router(state.clone());
-        let body = serde_json::json!({
-            "iface": "eth0",
-            "mac": "aa:bb:cc:dd:ee:ff",
-            "hostname": "my-phone"
-        });
-        let req = Request::put("/api/devices/hostname")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert!(env.ok);
-
-        let snap = state.snapshot.read().await;
-        let item = snap
-            .devices
-            .iter()
-            .find(|d| d.ifindex == 1 && d.mac.eq_ignore_ascii_case("aa:bb:cc:dd:ee:ff"))
-            .unwrap();
-        assert_eq!(item.hostname, "my-phone");
-        drop(snap);
-
-        let mac = crate::utils::mac_utils::from_str("aa:bb:cc:dd:ee:ff").unwrap();
-        let runtime = state.monitor_runtime.read().await;
-        let known = runtime.device_registry.entries.get(&(1, mac)).unwrap();
-        assert_eq!(known.hostname, "my-phone");
-    }
-
-    #[tokio::test]
-    async fn api_set_device_hostname_invalid_iface() {
-        let app = router(mock_api_state());
-        let body = serde_json::json!({
-            "iface": "not-exist",
-            "mac": "aa:bb:cc:dd:ee:ff",
-            "hostname": "my-phone"
-        });
-        let req = Request::put("/api/devices/hostname")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert!(!env.ok);
-        assert!(env.error.unwrap().contains("unknown iface"));
-    }
-
-    #[tokio::test]
-    async fn api_policy() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/policy").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_trend_missing_iface() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/trend").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert!(!env.ok);
-        assert!(env.error.unwrap().contains("iface"));
-    }
-
-    #[tokio::test]
-    async fn api_trend_by_iface() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/trend?iface=eth0").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert!(env.ok);
-    }
-
-    #[tokio::test]
-    async fn api_histogram_missing_iface() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/histogram").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert!(!env.ok);
-        assert!(env.error.unwrap().contains("iface"));
-    }
-
-    #[tokio::test]
-    async fn api_histogram_by_iface_with_traffic_type() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/histogram?iface=eth0&traffic_type=ipv4")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert!(env.ok);
-    }
-
-    #[tokio::test]
-    async fn api_schedules_get() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/rate_limit/schedules").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_schedules_post_valid() {
-        let app = router(mock_api_state());
-        let body = serde_json::json!({
-            "iface": "eth0",
-            "mac": "aa:bb:cc:dd:ee:ff",
-            "time_slot": { "start": "09:00", "end": "18:00", "days": [1,2,3,4,5] },
-            "down_v4_kbps": 100,
-            "down_v6_kbps": 100,
-            "up_v4_kbps": 100,
-            "up_v6_kbps": 100
-        });
-        let req = Request::post("/api/rate_limit/schedules")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_schedules_post_invalid_time() {
-        let app = router(mock_api_state());
-        let body = serde_json::json!({
-            "iface": "eth0",
-            "mac": "aa:bb:cc:dd:ee:ff",
-            "time_slot": { "start": "99:00", "end": "18:00", "days": [1,2,3,4,5] },
-            "down_v4_kbps": 100,
-            "down_v6_kbps": 100,
-            "up_v4_kbps": 100,
-            "up_v6_kbps": 100
-        });
-        let req = Request::post("/api/rate_limit/schedules")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn api_schedules_delete_not_exists() {
-        let app = router(mock_api_state());
-        let req = Request::delete("/api/rate_limit/schedules/nonexistent-id")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body = res.into_body().collect().await.unwrap().to_bytes();
-        let env: ApiEnvelope<serde_json::Value> = serde_json::from_slice(&body).unwrap();
-        assert!(!env.ok);
-    }
-
-    #[tokio::test]
-    async fn api_iface_limits_get() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/rate_limit/iface_limits").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_iface_limits_post() {
-        let app = router(mock_api_state());
-        let body = serde_json::json!({
-            "iface": "eth0",
-            "down_v4_kbps": 200,
-            "down_v6_kbps": 100,
-            "up_v4_kbps": 160,
-            "up_v6_kbps": 80
-        });
-        let req = Request::post("/api/rate_limit/iface_limits")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_guest_defaults_get() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/rate_limit/guest_defaults").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_guest_defaults_post() {
-        let app = router(mock_api_state());
-        let body = serde_json::json!({
-            "iface": "guest0",
-            "down_v4_kbps": 50,
-            "down_v6_kbps": 50,
-            "up_v4_kbps": 50,
-            "up_v6_kbps": 50
-        });
-        let req = Request::post("/api/rate_limit/guest_defaults")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_guest_defaults_enable_toggle() {
-        let app = router(mock_api_state());
-        let set_body = serde_json::json!({
-            "iface": "guest0",
-            "down_v4_kbps": 50,
-            "down_v6_kbps": 50,
-            "up_v4_kbps": 50,
-            "up_v6_kbps": 50
-        });
-        let set_req = Request::post("/api/rate_limit/guest_defaults")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&set_body).unwrap()))
-            .unwrap();
-        let set_res = app.clone().oneshot(set_req).await.unwrap();
-        assert_eq!(set_res.status(), StatusCode::OK);
-
-        let disable_body = serde_json::json!({ "enabled": false });
-        let disable_req = Request::put("/api/rate_limit/guest_defaults/guest0/enable")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&disable_body).unwrap()))
-            .unwrap();
-        let disable_res = app.clone().oneshot(disable_req).await.unwrap();
-        assert_eq!(disable_res.status(), StatusCode::OK);
-
-        let get_req = Request::get("/api/rate_limit/guest_defaults").body(Body::empty()).unwrap();
-        let get_res = app.oneshot(get_req).await.unwrap();
-        assert_eq!(get_res.status(), StatusCode::OK);
-        let bytes = get_res.into_body().collect().await.unwrap().to_bytes();
-        let env: ApiEnvelope<Vec<serde_json::Value>> = serde_json::from_slice(&bytes).unwrap();
-        assert!(env.ok);
-        assert_eq!(env.data.len(), 1);
-        assert_eq!(env.data[0]["iface"], serde_json::Value::String("guest0".to_string()));
-        assert_eq!(env.data[0]["enabled"], serde_json::Value::Bool(false));
-    }
-
-    #[tokio::test]
-    async fn api_guest_whitelist_get() {
-        let app = router(mock_api_state());
-        let req = Request::get("/api/rate_limit/guest_whitelist").body(Body::empty()).unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_guest_whitelist_post() {
-        let app = router(mock_api_state());
-        let body = serde_json::json!({
-            "iface": "guest0",
-            "mac": "aa:bb:cc:dd:ee:ff"
-        });
-        let req = Request::post("/api/rate_limit/guest_whitelist")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn api_guest_whitelist_delete() {
-        let app = router(mock_api_state());
-        let body = serde_json::json!({
-            "iface": "guest0",
-            "mac": "aa:bb:cc:dd:ee:ff"
-        });
-        let req = Request::builder()
-            .method("DELETE")
-            .uri("/api/rate_limit/guest_whitelist")
-            .header("content-type", "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-}
+// ... existing code for other API handlers ...

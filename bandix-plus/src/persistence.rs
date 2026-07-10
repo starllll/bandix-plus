@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::monitor::{
-    AggregatedBucket, CurrentHourPointState, HistogramHistory, MonitorRuntime, MonitorRuntimeState, export_runtime_state,
+    AggregatedBucket, CurrentHourPointState, CurrentHourState, HistogramHistory, MonitorRuntime, MonitorRuntimeState, export_runtime_state,
     import_runtime_state,
 };
 use crate::policy::{
@@ -34,6 +34,8 @@ pub struct PersistenceManager {
     current_hour_path: PathBuf,
     iface_traffic_dir: PathBuf,
     device_traffic_dir: PathBuf,
+    // 新增：IP流量目录
+    ip_traffic_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +60,8 @@ struct PersistedCurrentHourFile {
 struct PersistedCurrentHourState {
     iface: Vec<PersistedCurrentHourIface>,
     device: Vec<PersistedCurrentHourDevice>,
+    // 新增：IP状态
+    ip: Vec<PersistedCurrentHourIp>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +75,15 @@ struct PersistedCurrentHourIface {
 struct PersistedCurrentHourDevice {
     logical_iface: String,
     mac: String,
+    hour_start_ts_ms: u64,
+    points: Vec<CurrentHourPointState>,
+}
+
+// 新增：IP小时状态
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedCurrentHourIp {
+    logical_iface: String,
+    ip: String,
     hour_start_ts_ms: u64,
     points: Vec<CurrentHourPointState>,
 }
@@ -93,8 +106,11 @@ impl PersistenceManager {
         let data_dir = data_dir.as_ref().to_path_buf();
         let iface_traffic_dir = data_dir.join("traffic").join("iface");
         let device_traffic_dir = data_dir.join("traffic").join("device");
+        // 新增：创建IP流量目录
+        let ip_traffic_dir = data_dir.join("traffic").join("ip");
         fs::create_dir_all(&iface_traffic_dir)?;
         fs::create_dir_all(&device_traffic_dir)?;
+        fs::create_dir_all(&ip_traffic_dir)?;
         Ok(Self {
             policy_path: data_dir.join("policy_state.json"),
             devices_path: data_dir.join("devices_state.json"),
@@ -102,6 +118,7 @@ impl PersistenceManager {
             data_dir,
             iface_traffic_dir,
             device_traffic_dir,
+            ip_traffic_dir, // 新增：IP流量目录
         })
     }
 
@@ -178,9 +195,22 @@ impl PersistenceManager {
                 points: item.points,
             });
         }
+        // 新增：处理IP状态
+        let mut ip = Vec::new();
+        for item in exported.ip {
+            let Some(info) = topology.by_ifindex(item.ifindex) else {
+                continue;
+            };
+            ip.push(PersistedCurrentHourIp {
+                logical_iface: info.name.clone(),
+                ip: item.ip,
+                hour_start_ts_ms: item.hour_start_ts_ms,
+                points: item.points,
+            });
+        }
         let data = PersistedCurrentHourFile {
             schema_version: CURRENT_HOUR_SCHEMA_VERSION,
-            state: PersistedCurrentHourState { iface, device },
+            state: PersistedCurrentHourState { iface, device, ip },
         };
         write_json_atomic(&self.current_hour_path, &data)
     }
@@ -215,6 +245,14 @@ impl PersistenceManager {
             };
             histogram.restore_current_hour_device_state(ifindex, item.mac, item.hour_start_ts_ms, item.points, now_ms);
         }
+        
+        // 新增：加载IP状态
+        for item in data.state.ip {
+            let Some(ifindex) = topology.ifindex_by_name(&item.logical_iface) else {
+                continue;
+            };
+            histogram.restore_current_hour_ip_state(ifindex, item.ip, item.hour_start_ts_ms, item.points, now_ms);
+        }
         Ok(())
     }
 
@@ -231,9 +269,19 @@ impl PersistenceManager {
         append_ring_record(&path, &RingRecord { bucket: bucket.clone() })
     }
 
+    // 新增：追加IP桶记录
+    pub fn append_ip_bucket(&self, iface_name: &str, ip: &str, bucket: &AggregatedBucket) -> anyhow::Result<()> {
+        let path = self
+            .ip_traffic_dir
+            .join(format!("{}-{}.ring", encode_component(iface_name), encode_component(ip)));
+        append_ring_record(&path, &RingRecord { bucket: bucket.clone() })
+    }
+
     pub fn load_histogram(&self, topology: &TopologySnapshot, histogram: &mut HistogramHistory) -> anyhow::Result<()> {
         self.load_iface_histogram(topology, histogram)?;
         self.load_device_histogram(topology, histogram)?;
+        // 新增：加载IP历史记录
+        self.load_ip_histogram(topology, histogram)?;
         Ok(())
     }
 
@@ -300,7 +348,46 @@ impl PersistenceManager {
         }
         Ok(())
     }
+
+    // 新增：加载IP历史记录
+    fn load_ip_histogram(&self, topology: &TopologySnapshot, histogram: &mut HistogramHistory) -> anyhow::Result<()> {
+        if !self.ip_traffic_dir.exists() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&self.ip_traffic_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !is_ring_file(&path) {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|x| x.to_str()) else {
+                continue;
+            };
+            let Some((iface_hex, ip_hex)) = stem.rsplit_once('-') else {
+                quarantine_bad_file(&path)?;
+                continue;
+            };
+            let Some(iface_name) = decode_component(iface_hex) else {
+                quarantine_bad_file(&path)?;
+                continue;
+            };
+            let Some(ip) = decode_component(ip_hex) else {
+                quarantine_bad_file(&path)?;
+                continue;
+            };
+            let Some(ifindex) = topology.ifindex_by_name(&iface_name) else {
+                continue;
+            };
+            let records = read_ring_records(&path)?;
+            for r in records {
+                histogram.restore_ip_bucket(ifindex, ip.clone(), r.bucket);
+            }
+        }
+        Ok(())
+    }
 }
+
+// ... existing code continues unchanged ...
 
 fn write_json_atomic<T: Serialize>(path: &Path, data: &T) -> anyhow::Result<()> {
     let Some(parent) = path.parent() else {
@@ -631,7 +718,6 @@ fn checksum32(data: &[u8]) -> u32 {
         hash ^= *b as u32;
         hash = hash.wrapping_mul(0x01000193);
     }
-    hash
 }
 
 fn is_ring_file(path: &Path) -> bool {

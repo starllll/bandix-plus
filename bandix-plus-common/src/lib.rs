@@ -35,6 +35,17 @@ pub struct DeviceTrafficKey {
     pub direction: u8,
 }
 
+// 新增：按IP地址统计的流量键
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct IpTrafficKey {
+    pub ifindex: u32,
+    pub ip_addr: [u8; 16],  // 支持IPv4 (填充到16字节) 和 IPv6
+    pub ip_version: u8,
+    pub direction: u8,
+    pub _pad: [u8; 2],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrafficValue {
@@ -89,6 +100,9 @@ pub struct RateBucketValue {
 unsafe impl Pod for InterfaceTrafficKey {}
 #[cfg(feature = "user")]
 unsafe impl Pod for DeviceTrafficKey {}
+// 新增：IP流量键也需要实现Pod trait
+#[cfg(feature = "user")]
+unsafe impl Pod for IpTrafficKey {}
 #[cfg(feature = "user")]
 unsafe impl Pod for TrafficValue {}
 #[cfg(feature = "user")]

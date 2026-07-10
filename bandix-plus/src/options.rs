@@ -64,6 +64,13 @@ pub struct Options {
     #[arg(short, long, help = "Network interface to monitor (can specify multiple times)")]
     pub iface: Vec<String>,
 
+    // 新增：指定虚拟接口的选项
+    #[arg(
+        long = "virtual-iface",
+        help = "Virtual network interfaces to track by IP (e.g., tailscale, wg, tun) (can specify multiple times)"
+    )]
+    pub virtual_iface: Vec<String>,
+
     #[arg(
         long,
         default_value = "info",
