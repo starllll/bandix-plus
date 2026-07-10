@@ -19,6 +19,15 @@ pub enum AggregateBucket {
     Daily,
 }
 
+// 定义已完成聚合类型枚举
+#[derive(Debug, Clone)]
+pub enum CompletedAggregate {
+    Iface { iface: u32, bucket: AggregatedBucket },
+    Device { iface: u32, mac: String, bucket: AggregatedBucket },
+    // 新增：IP统计聚合
+    Ip { iface: u32, ip: String, bucket: AggregatedBucket },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CounterQuad {
     pub up_v4_bps: u64,
@@ -494,6 +503,114 @@ impl HistogramHistory {
                 .collect(),
         }
     }
+
+    // 新增：摄取快照并收集已完成的桶，包括IP统计
+    pub fn ingest_snapshot_collect_completed(&mut self, snapshot: &SnapshotData) -> Vec<CompletedAggregate> {
+        let mut completed = Vec::new();
+        
+        // 处理接口级别的历史数据
+        for iface in &snapshot.interfaces {
+            let ifindex = iface.ifindex;
+            let (hour_start, _) = hourly_bucket_local(snapshot.timestamp_ms);
+            
+            // 获取或创建当前小时的数据
+            let (current_start, points) = self.current_hour_iface.entry(ifindex).or_insert_with(|| {
+                (hour_start, Vec::new())
+            });
+            
+            // 如果是新的小时，则将旧数据移到已完成列表
+            if *current_start != hour_start {
+                if !points.is_empty() {
+                    let bucket = points_to_bucket(*current_start, points);
+                    self.completed_iface.entry(ifindex).or_insert_with(Vec::new).push(bucket);
+                    completed.push(CompletedAggregate::Iface { 
+                        iface: ifindex, 
+                        bucket: bucket 
+                    });
+                    points.clear();
+                }
+                *current_start = hour_start;
+            }
+            
+            // 添加当前点
+            points.push(CurrentHourPointState {
+                ts_ms: snapshot.timestamp_ms,
+                metrics: iface.metrics.clone(),
+            });
+        }
+
+        // 处理设备级别的历史数据
+        for device in &snapshot.devices {
+            let key = DeviceSeriesKey {
+                ifindex: device.ifindex,
+                mac: device.mac.clone(),
+            };
+            let (hour_start, _) = hourly_bucket_local(snapshot.timestamp_ms);
+            
+            // 获取或创建当前小时的数据
+            let (current_start, points) = self.current_hour_device.entry(key.clone()).or_insert_with(|| {
+                (hour_start, Vec::new())
+            });
+            
+            // 如果是新的小时，则将旧数据移到已完成列表
+            if *current_start != hour_start {
+                if !points.is_empty() {
+                    let bucket = points_to_bucket(*current_start, points);
+                    self.completed_device.entry(key).or_insert_with(Vec::new).push(bucket);
+                    completed.push(CompletedAggregate::Device { 
+                        iface: device.ifindex, 
+                        mac: device.mac.clone(), 
+                        bucket: bucket 
+                    });
+                    points.clear();
+                }
+                *current_start = hour_start;
+            }
+            
+            // 添加当前点
+            points.push(CurrentHourPointState {
+                ts_ms: snapshot.timestamp_ms,
+                metrics: device.metrics.clone(),
+            });
+        }
+
+        // 处理IP级别的历史数据
+        for ip in &snapshot.ips {
+            let key = IpSeriesKey {
+                ifindex: ip.ifindex,
+                ip: ip.ip_addr.clone(),
+            };
+            let (hour_start, _) = hourly_bucket_local(snapshot.timestamp_ms);
+            
+            // 获取或创建当前小时的数据
+            let (current_start, points) = self.current_hour_ip.entry(key.clone()).or_insert_with(|| {
+                (hour_start, Vec::new())
+            });
+            
+            // 如果是新的小时，则将旧数据移到已完成列表
+            if *current_start != hour_start {
+                if !points.is_empty() {
+                    let bucket = points_to_bucket(*current_start, points);
+                    self.completed_ip.entry(key).or_insert_with(Vec::new).push(bucket);
+                    completed.push(CompletedAggregate::Ip { 
+                        iface: ip.ifindex, 
+                        ip: ip.ip_addr.clone(), 
+                        bucket: bucket 
+                    });
+                    points.clear();
+                }
+                *current_start = hour_start;
+            }
+            
+            // 添加当前点
+            points.push(CurrentHourPointState {
+                ts_ms: snapshot.timestamp_ms,
+                metrics: ip.metrics.clone(),
+            });
+        }
+        
+        completed
+    }
 }
 
 #[derive(Default)]
@@ -956,6 +1073,21 @@ pub fn build_snapshot(
         devices,
         ips, // 添加IP列表到快照
     })
+}
+
+// 添加别名函数供外部调用
+pub fn collect_snapshot(
+    ebpf: &mut Ebpf,
+    runtime: &mut MonitorRuntime,
+    topology: &TopologySnapshot,
+    monitor_ifaces: &HashSet<&str>,
+    interval: Duration,
+) -> anyhow::Result<SnapshotData> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    build_snapshot(ebpf, runtime, topology, monitor_ifaces, now_ms)
 }
 
 fn add_quad(dst: &mut CounterQuad, src: &CounterQuad) {

@@ -12,6 +12,31 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+use aya::maps::HashMap as AyaHashMap;
+use bandix_plus_common::IpTrafficKey;
+
+/// 设置虚拟接口映射到eBPF程序
+fn setup_virtual_interfaces(ebpf: &mut aya::Ebpf, virtual_ifaces: &[String], topology: &TopologySnapshot) -> anyhow::Result<()> {
+    // 获取 VIRTUAL_INTERFACES_MAP 映射
+    let mut map: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(ebpf.map_mut("VIRTUAL_INTERFACES_MAP").ok_or_else(|| {
+        anyhow::anyhow!("VIRTUAL_INTERFACES_MAP not found")
+    })?)?;
+
+    // 遍历提供的虚拟接口名称
+    for iface_name in virtual_ifaces {
+        // 通过拓扑找到对应的接口索引
+        if let Some(iface_info) = topology.interfaces().iter().find(|iface| &iface.name == iface_name) {
+            // 将接口索引添加到虚拟接口映射中
+            map.insert(iface_info.ifindex, 1, 0)?;
+            log::info!("Added virtual interface: {} (ifindex: {})", iface_name, iface_info.ifindex);
+        } else {
+            log::warn!("Virtual interface '{}' not found in topology", iface_name);
+        }
+    }
+
+    Ok(())
+}
+
 /// 主入口：初始化日志、校验参数并启动监控服务。
 pub async fn run(options: Options) -> anyhow::Result<()> {
     validate_arguments(&options)?;
@@ -265,33 +290,6 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
     let bind_addr = format!("{}:{}", options.host, options.port);
     log::info!("API server listening on {}", bind_addr);
     start_server(&bind_addr, api_state).await?;
-
-    Ok(())
-}
-
-/// 设置虚拟接口映射到eBPF程序
-fn setup_virtual_interfaces(ebpf: &aya::Ebpf, virtual_ifaces: &[String], topology: &TopologySnapshot) -> anyhow::Result<()> {
-    // 获取虚拟接口的ifindex
-    let virtual_ifindices: Vec<u32> = virtual_ifaces
-        .iter()
-        .filter_map(|iface_name| topology.ifindex_by_name(iface_name))
-        .collect();
-
-    if !virtual_ifindices.is_empty() {
-        log::info!("Setting up virtual interfaces for IP-level monitoring: {:?}", virtual_ifindices);
-        
-        // 尝试访问eBPF中的VIRTUAL_INTERFACES_MAP（如果存在）
-        if let Ok(mut map) = ebpf.map_mut("VIRTUAL_INTERFACES_MAP") {
-            use aya::maps::HashMap as AyaHashMap;
-            let virtual_iface_map: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(map)?;
-            
-            for &ifindex in &virtual_ifindices {
-                virtual_iface_map.insert(ifindex, 1, 0)?;
-            }
-        } else {
-            log::warn!("VIRTUAL_INTERFACES_MAP not found in eBPF program, virtual interface detection will not work");
-        }
-    }
 
     Ok(())
 }
