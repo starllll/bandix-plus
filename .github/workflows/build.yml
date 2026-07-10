@@ -14,6 +14,9 @@ on:
 env:
   TZ: Asia/Shanghai
 
+permissions:
+  contents: write
+
 jobs:
   build_bandix-plus:
     name: Check Version
