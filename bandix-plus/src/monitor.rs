@@ -1145,6 +1145,75 @@ pub fn collect_snapshot(
         );
     }
 
+    // Add synthetic devices observed in eBPF maps but not present in neighbor table
+    for (k, _v) in &device_stats {
+        let key = (k.ifindex, k.mac);
+        if devices_group.contains_key(&key) {
+            continue;
+        }
+
+        // Check for our synthetic MAC markers: 0x02,0x00 (IPv4) or 0x02,0x01 (IPv6)
+        if k.mac[0] != 0x02 {
+            continue;
+        }
+
+        let Some(logical_iface) = topology.by_ifindex(k.ifindex) else {
+            continue;
+        };
+        if !monitor_set.is_empty() && !monitor_set.contains(logical_iface.name.as_str()) {
+            continue;
+        }
+
+        let mut ipv4_vec: Vec<String> = Vec::new();
+        let mut ipv6_vec: Vec<String> = Vec::new();
+        let mut subnet = "-".to_string();
+
+        if k.mac[1] == 0x00 {
+            // IPv4 synthetic: last 4 bytes are IPv4
+            let ip = format!("{}.{}.{}.{}", k.mac[2], k.mac[3], k.mac[4], k.mac[5]);
+            ipv4_vec.push(ip.clone());
+            subnet = logical_iface
+                .ipv4_cidrs
+                .iter()
+                .find(|cidr| system_utils::ipv4_in_cidr(&ip, cidr))
+                .cloned()
+                .unwrap_or_else(|| logical_iface.ipv4_cidrs.first().cloned().unwrap_or_else(|| "-".to_string()));
+        } else if k.mac[1] == 0x01 {
+            // IPv6 synthetic: we only have last4 bytes; present as partial identifier
+            let part = format!("{:02x}{:02x}{:02x}{:02x}", k.mac[2], k.mac[3], k.mac[4], k.mac[5]);
+            ipv6_vec.push(format!("ipv6-partial:{}", part));
+            subnet = logical_iface.ipv6_cidrs.first().cloned().unwrap_or_else(|| "-".to_string());
+        } else {
+            continue;
+        }
+
+        devices_group.insert(
+            key,
+            DeviceListItem {
+                ifindex: k.ifindex,
+                logical_iface: logical_iface.name.clone(),
+                subnet,
+                ipv4: ipv4_vec,
+                ipv6: ipv6_vec,
+                mac: mac_utils::to_string(&k.mac),
+                hostname: runtime
+                    .device_registry
+                    .entries
+                    .get(&key)
+                    .and_then(|known| {
+                        let h = known.hostname.trim();
+                        if h.is_empty() || h == "-" { None } else { Some(known.hostname.clone()) }
+                    })
+                    .unwrap_or_else(|| "-".to_string()),
+                metrics: CounterQuad::default(),
+                cumulative: CounterQuad::default(),
+                online: true,
+                last_seen_ms: now_ms,
+                neighbor_state: Some("synthetic".to_string()),
+            },
+        );
+    }
+
     for (k, v) in &device_stats {
         if let Some(entry) = devices_group.get_mut(&(k.ifindex, k.mac)) {
             let prev = runtime.prev_device_bytes.get(k).copied().unwrap_or(0);
@@ -1153,6 +1222,7 @@ pub fn collect_snapshot(
             fill_quad(k.ip_version, k.direction, &mut entry.metrics, delta, sec);
         }
     }
+
 
     for (key, dev) in devices_group.iter_mut() {
         let cum = runtime.cumulative_device.entry(*key).or_default();
