@@ -12,6 +12,13 @@ use crate::utils::mac_utils;
 use crate::utils::system_utils;
 use crate::utils::time_utils;
 
+// 定义聚合桶类型枚举
+#[derive(Debug, Clone, Copy)]
+pub enum AggregateBucket {
+    Hourly,
+    Daily,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CounterQuad {
     pub up_v4_bps: u64,
