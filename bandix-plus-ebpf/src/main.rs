@@ -10,7 +10,7 @@ use aya_ebpf::{
 };
 use bandix_plus_common::{
     DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, InterfaceTrafficKey, IpVersion, RateBucketValue,
-    RateLimitValue, TrafficDirection, TrafficValue,
+    RateLimitValue, SourceIpTrafficKey, TrafficDirection, TrafficValue,
 };
 
 const ETH_P_IP: u16 = 0x0800;
@@ -49,10 +49,37 @@ struct PppoeSessionHdr {
     ppp_proto: u16,
 }
 
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Ipv4Hdr {
+    version_ihl: u8,
+    dscp_ecn: u8,
+    total_len: u16,
+    identification: u16,
+    flags_frag: u16,
+    ttl: u8,
+    protocol: u8,
+    checksum: u16,
+    src_addr: [u8; 4],
+    dst_addr: [u8; 4],
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct Ipv6Hdr {
+    version_class_flow: [u8; 4],
+    payload_len: u16,
+    next_header: u8,
+    hop_limit: u8,
+    src_addr: [u8; 16],
+    dst_addr: [u8; 16],
+}
+
 #[derive(Clone, Copy)]
 struct PacketMeta {
     ip_version: u8,
     mac: Option<[u8; 6]>,
+    src_ip: Option<[u8; 16]>,
 }
 
 #[classifier]
@@ -76,6 +103,9 @@ static IFACE_TRAFFIC_STATS: HashMap<InterfaceTrafficKey, TrafficValue> = HashMap
 
 #[map]
 static DEVICE_TRAFFIC_STATS: HashMap<DeviceTrafficKey, TrafficValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
+
+#[map]
+static SOURCE_IP_TRAFFIC_STATS: HashMap<SourceIpTrafficKey, TrafficValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
 
 #[map]
 static DEVICE_LIMIT_GLOBAL: HashMap<DeviceGlobalLimitKey, RateLimitValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
@@ -119,6 +149,19 @@ fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
         bump_device_counter(&device_key, pkt_len);
     }
 
+    if meta.mac.is_none() {
+        if let Some(src_ip) = meta.src_ip {
+            let source_key = SourceIpTrafficKey {
+                ifindex,
+                ip_version: meta.ip_version,
+                direction,
+                _pad: [0; 2],
+                src_ip,
+            };
+            bump_source_ip_counter(&source_key, pkt_len);
+        }
+    }
+
     if should_drop_by_rate_limit(ifindex, meta.mac, meta.ip_version, direction, pkt_len) {
         return Ok(TC_ACT_SHOT);
     }
@@ -136,16 +179,30 @@ fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
                 }
                 _ => Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_dest)) }),
             };
-            return Some(PacketMeta { ip_version, mac });
+            return Some(PacketMeta {
+                ip_version,
+                mac,
+                src_ip: None,
+            });
         }
     }
 
     // L3-style interfaces (e.g. ppp/tun/wireguard) may have no Ethernet header.
     if let Some(ip_version) = resolve_ip_version_from_l3(ctx, 0) {
-        return Some(PacketMeta { ip_version, mac: None });
+        let src_ip = read_source_ip_bytes(ctx, ip_version, 0);
+        return Some(PacketMeta {
+            ip_version,
+            mac: None,
+            src_ip,
+        });
     }
     if let Some(ip_version) = resolve_ip_version_from_ppp(ctx) {
-        return Some(PacketMeta { ip_version, mac: None });
+        let src_ip = read_source_ip_bytes(ctx, ip_version, 2);
+        return Some(PacketMeta {
+            ip_version,
+            mac: None,
+            src_ip,
+        });
     }
     None
 }
@@ -194,6 +251,24 @@ fn resolve_ip_version_from_ppp(ctx: &TcContext) -> Option<u8> {
     None
 }
 
+fn read_source_ip_bytes(ctx: &TcContext, ip_version: u8, offset: usize) -> Option<[u8; 16]> {
+    match ip_version {
+        x if x == IpVersion::V4 as u8 => {
+            let hdr = ptr_at::<Ipv4Hdr>(ctx, offset).ok()?;
+            let src = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*hdr).src_addr)) };
+            let mut out = [0u8; 16];
+            out[..4].copy_from_slice(&src);
+            Some(out)
+        }
+        x if x == IpVersion::V6 as u8 => {
+            let hdr = ptr_at::<Ipv6Hdr>(ctx, offset).ok()?;
+            let src = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*hdr).src_addr)) };
+            Some(src)
+        }
+        _ => None,
+    }
+}
+
 fn ptr_at<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
     let start = ctx.data();
     let end = ctx.data_end();
@@ -214,6 +289,19 @@ fn bump_iface_counter(key: &InterfaceTrafficKey, bytes: u64) {
 
         let value = TrafficValue { packets: 1, bytes };
         let _ = IFACE_TRAFFIC_STATS.insert(key, &value, 0);
+    }
+}
+
+fn bump_source_ip_counter(key: &SourceIpTrafficKey, bytes: u64) {
+    unsafe {
+        if let Some(value) = SOURCE_IP_TRAFFIC_STATS.get_ptr_mut(key) {
+            (*value).packets = (*value).packets.saturating_add(1);
+            (*value).bytes = (*value).bytes.saturating_add(bytes);
+            return;
+        }
+
+        let value = TrafficValue { packets: 1, bytes };
+        let _ = SOURCE_IP_TRAFFIC_STATS.insert(key, &value, 0);
     }
 }
 

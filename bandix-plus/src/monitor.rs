@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aya::Ebpf;
 use aya::maps::HashMap as AyaHashMap;
-use bandix_plus_common::{DeviceTrafficKey, InterfaceTrafficKey, IpVersion, TrafficDirection, TrafficValue};
+use bandix_plus_common::{DeviceTrafficKey, InterfaceTrafficKey, IpVersion, SourceIpTrafficKey, TrafficDirection, TrafficValue};
 use chrono::{Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +45,7 @@ pub struct KnownDevice {
 pub struct MonitorRuntime {
     pub prev_iface_bytes: HashMap<InterfaceTrafficKey, u64>,
     pub prev_device_bytes: HashMap<DeviceTrafficKey, u64>,
+    pub prev_source_ip_bytes: HashMap<SourceIpTrafficKey, u64>,
     pub cumulative_iface: HashMap<u32, CounterQuad>,
     pub cumulative_device: HashMap<(u32, [u8; 6]), CounterQuad>,
     pub last_snapshot_ms: Option<u64>,
@@ -129,6 +130,14 @@ pub struct PersistedKnownDevice {
     pub last_seen_ms: u64,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SourceIpCounter {
+    pub up_bps: u64,
+    pub down_bps: u64,
+    pub up_bytes: u64,
+    pub down_bytes: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct InterfaceOverviewItem {
     pub ifindex: u32,
@@ -136,6 +145,16 @@ pub struct InterfaceOverviewItem {
     pub zone: String,
     pub metrics: CounterQuad,
     pub cumulative: CounterQuad,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub source_ip_stats: Vec<SourceIpStat>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceIpStat {
+    pub ip: String,
+    pub ip_version: u8,
+    pub direction: u8,
+    pub metrics: SourceIpCounter,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -974,6 +993,7 @@ pub fn build_recovered_snapshot(runtime: &MonitorRuntime, topology: &TopologySna
                 zone: format!("{:?}", iface.zone).to_ascii_lowercase(),
                 metrics: CounterQuad::default(),
                 cumulative: *cumulative,
+                source_ip_stats: Vec::new(),
             });
         }
     }
@@ -1035,6 +1055,7 @@ pub fn collect_snapshot(
 
     let mut interfaces = Vec::new();
     let mut seen_iface_names = HashSet::new();
+    let source_ip_stats = read_source_ip_stats(ebpf)?;
     for iface_name in monitor_ifaces {
         if !seen_iface_names.insert(iface_name.as_str()) {
             continue;
@@ -1058,12 +1079,14 @@ pub fn collect_snapshot(
             .unwrap_or_else(|| "other".to_string());
         let cum = runtime.cumulative_iface.entry(ifindex).or_default();
         add_quad(cum, &metrics);
+        let source_ip_stats_for_iface = build_source_ip_stats(ifindex, &source_ip_stats, &mut runtime.prev_source_ip_bytes, sec);
         interfaces.push(InterfaceOverviewItem {
             ifindex,
             ifname: iface_name.clone(),
             zone,
             metrics,
             cumulative: *cum,
+            source_ip_stats: source_ip_stats_for_iface,
         });
     }
 
@@ -1245,6 +1268,20 @@ fn read_iface_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<InterfaceTrafficK
     Ok(result)
 }
 
+/// 从 eBPF map 读取按源 IP 的虚拟接口流量统计
+fn read_source_ip_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<SourceIpTrafficKey, TrafficValue>> {
+    let map = ebpf
+        .map_mut("SOURCE_IP_TRAFFIC_STATS")
+        .ok_or_else(|| anyhow::anyhow!("SOURCE_IP_TRAFFIC_STATS map not found"))?;
+    let map: AyaHashMap<_, SourceIpTrafficKey, TrafficValue> = AyaHashMap::try_from(map)?;
+    let mut result = HashMap::new();
+    for entry in map.iter() {
+        let (k, v) = entry?;
+        result.insert(k, v);
+    }
+    Ok(result)
+}
+
 /// 从 eBPF map 读取设备级流量统计
 fn read_device_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<DeviceTrafficKey, TrafficValue>> {
     let map = ebpf
@@ -1260,6 +1297,71 @@ fn read_device_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<DeviceTrafficKey
 }
 
 /// 根据 IP 版本和方向填充四元组，bytes 存增量
+fn source_ip_bytes_to_string(bytes: &[u8], ip_version: u8) -> String {
+    if ip_version == IpVersion::V4 as u8 {
+        let mut octets = [0u8; 4];
+        octets.copy_from_slice(&bytes[..4]);
+        return octets.iter().map(|b| b.to_string()).collect::<Vec<_>>().join(".");
+    }
+
+    if ip_version == IpVersion::V6 as u8 {
+        return std::net::Ipv6Addr::from(<[u8; 16]>::try_from(bytes[..16].iter().copied().collect::<Vec<u8>>()).unwrap_or_default())
+            .to_string();
+    }
+
+    String::new()
+}
+
+fn fill_source_ip_counter(ip_version: u8, direction: u8, counter: &mut SourceIpCounter, delta_bytes: u64, sec: f64) {
+    let delta_bps = ((delta_bytes as f64) * 8.0 / sec).round() as u64;
+    match (ip_version, direction) {
+        (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Ingress as u8 => {
+            counter.up_bps = counter.up_bps.saturating_add(delta_bps);
+            counter.up_bytes = counter.up_bytes.saturating_add(delta_bytes);
+        }
+        (x, y) if x == IpVersion::V4 as u8 && y == TrafficDirection::Egress as u8 => {
+            counter.down_bps = counter.down_bps.saturating_add(delta_bps);
+            counter.down_bytes = counter.down_bytes.saturating_add(delta_bytes);
+        }
+        (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Ingress as u8 => {
+            counter.up_bps = counter.up_bps.saturating_add(delta_bps);
+            counter.up_bytes = counter.up_bytes.saturating_add(delta_bytes);
+        }
+        (x, y) if x == IpVersion::V6 as u8 && y == TrafficDirection::Egress as u8 => {
+            counter.down_bps = counter.down_bps.saturating_add(delta_bps);
+            counter.down_bytes = counter.down_bytes.saturating_add(delta_bytes);
+        }
+        _ => {}
+    }
+}
+
+fn build_source_ip_stats(
+    ifindex: u32,
+    source_ip_stats: &HashMap<SourceIpTrafficKey, TrafficValue>,
+    prev_source_ip_bytes: &mut HashMap<SourceIpTrafficKey, u64>,
+    sec: f64,
+) -> Vec<SourceIpStat> {
+    let mut items = Vec::new();
+    for (k, v) in source_ip_stats {
+        if k.ifindex != ifindex {
+            continue;
+        }
+        let prev = prev_source_ip_bytes.get(k).copied().unwrap_or(0);
+        let delta = delta_bytes(v.bytes, prev);
+        let mut counter = SourceIpCounter::default();
+        fill_source_ip_counter(k.ip_version, k.direction, &mut counter, delta, sec);
+        prev_source_ip_bytes.insert(*k, v.bytes);
+        items.push(SourceIpStat {
+            ip: source_ip_bytes_to_string(&k.src_ip, k.ip_version),
+            ip_version: k.ip_version,
+            direction: k.direction,
+            metrics: counter,
+        });
+    }
+    items.sort_by(|a, b| a.ip.cmp(&b.ip).then(a.direction.cmp(&b.direction)));
+    items
+}
+
 fn fill_quad(ip_version: u8, direction: u8, quad: &mut CounterQuad, delta_bytes: u64, sec: f64) {
     let delta_bps = ((delta_bytes as f64) * 8.0 / sec).round() as u64;
     match (ip_version, direction) {
@@ -1348,6 +1450,20 @@ mod aggregated_bucket_tests {
         .with_traffic_type(HistoryTrafficType::Ipv6);
         assert_eq!(b.up_v6_bytes, 30);
         assert_eq!(b.up_v4_bytes, 0);
+    }
+
+    #[test]
+    fn source_ip_counters_format_and_accumulate() {
+        let v4 = super::source_ip_bytes_to_string(&[192, 168, 1, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 4);
+        let v6 = super::source_ip_bytes_to_string(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 6);
+        assert_eq!(v4, "192.168.1.10");
+        assert_eq!(v6, "2001:db8::1");
+
+        let mut counter = super::SourceIpCounter::default();
+        super::fill_source_ip_counter(4, 2, &mut counter, 200, 2.0);
+        super::fill_source_ip_counter(4, 2, &mut counter, 300, 2.0);
+        assert_eq!(counter.up_bytes, 500);
+        assert_eq!(counter.up_bps, 400);
     }
 }
 

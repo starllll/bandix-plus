@@ -36,6 +36,16 @@ pub struct DeviceTrafficKey {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SourceIpTrafficKey {
+    pub ifindex: u32,
+    pub ip_version: u8,
+    pub direction: u8,
+    pub _pad: [u8; 2],
+    pub src_ip: [u8; 16],
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrafficValue {
     pub packets: u64,
@@ -89,6 +99,8 @@ pub struct RateBucketValue {
 unsafe impl Pod for InterfaceTrafficKey {}
 #[cfg(feature = "user")]
 unsafe impl Pod for DeviceTrafficKey {}
+#[cfg(feature = "user")]
+unsafe impl Pod for SourceIpTrafficKey {}
 #[cfg(feature = "user")]
 unsafe impl Pod for TrafficValue {}
 #[cfg(feature = "user")]
