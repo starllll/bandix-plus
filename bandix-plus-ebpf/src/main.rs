@@ -142,10 +142,22 @@ fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
 
     // L3-style interfaces (e.g. ppp/tun/wireguard) may have no Ethernet header.
     if let Some(ip_version) = resolve_ip_version_from_l3(ctx, 0) {
-        return Some(PacketMeta { ip_version, mac: None });
+        // Try to synthesize a 6-byte identifier from the source IP for virtual/L3 interfaces
+        let mac = match ip_version {
+            x if x == IpVersion::V4 as u8 => synth_mac_from_ipv4(ctx, 0),
+            x if x == IpVersion::V6 as u8 => synth_mac_from_ipv6(ctx, 0),
+            _ => None,
+        };
+        return Some(PacketMeta { ip_version, mac });
     }
     if let Some(ip_version) = resolve_ip_version_from_ppp(ctx) {
-        return Some(PacketMeta { ip_version, mac: None });
+        // PPP payload starts after 2 bytes of proto field
+        let mac = match ip_version {
+            x if x == IpVersion::V4 as u8 => synth_mac_from_ipv4(ctx, 2),
+            x if x == IpVersion::V6 as u8 => synth_mac_from_ipv6(ctx, 2),
+            _ => None,
+        };
+        return Some(PacketMeta { ip_version, mac });
     }
     None
 }
@@ -176,6 +188,26 @@ fn resolve_ip_version_from_l3(ctx: &TcContext, offset: usize) -> Option<u8> {
         6 => Some(IpVersion::V6 as u8),
         _ => None,
     }
+}
+
+// Construct a deterministic 6-byte synthetic MAC from IPv4 source address at given L3 offset.
+fn synth_mac_from_ipv4(ctx: &TcContext, l3_offset: usize) -> Option<[u8; 6]> {
+    // IPv4 header: source address is at offset 12 from start of IP header
+    let src_ptr = ptr_at::<u32>(ctx, l3_offset + 12).ok()?;
+    let src = u32::from_be(unsafe { core::ptr::read_unaligned(src_ptr) });
+    let b = src.to_be_bytes();
+    // Prefix with 0x02,0x00 to indicate synthetic-local-unicast marker
+    Some([0x02, 0x00, b[0], b[1], b[2], b[3]])
+}
+
+// Construct a deterministic 6-byte synthetic MAC from IPv6 source address at given L3 offset.
+fn synth_mac_from_ipv6(ctx: &TcContext, l3_offset: usize) -> Option<[u8; 6]> {
+    // IPv6 header: source address starts at offset 8 within IPv6 header; take its last 4 bytes
+    let src_last4_ptr = ptr_at::<u32>(ctx, l3_offset + 8 + 12).ok()?;
+    let last4 = u32::from_be(unsafe { core::ptr::read_unaligned(src_last4_ptr) });
+    let b = last4.to_be_bytes();
+    // Prefix with 0x02,0x01 to indicate synthetic-local-unicast IPv6 marker
+    Some([0x02, 0x01, b[0], b[1], b[2], b[3]])
 }
 
 fn resolve_ip_version_from_ppp(ctx: &TcContext) -> Option<u8> {
