@@ -400,6 +400,100 @@ impl HistogramHistory {
 
         (iface, device, ip)
     }
+
+    pub fn restore_iface_bucket(&mut self, ifindex: u32, bucket: AggregatedBucket) {
+        self.completed_iface.entry(ifindex).or_default().push(bucket);
+    }
+
+    pub fn restore_device_bucket(&mut self, ifindex: u32, mac: String, bucket: AggregatedBucket) {
+        let key = DeviceSeriesKey { ifindex, mac };
+        self.completed_device.entry(key).or_default().push(bucket);
+    }
+
+    // 新增：恢复IP桶数据
+    pub fn restore_ip_bucket(&mut self, ifindex: u32, ip: String, bucket: AggregatedBucket) {
+        let key = IpSeriesKey { ifindex, ip };
+        self.completed_ip.entry(key).or_default().push(bucket);
+    }
+
+    pub fn restore_current_hour_iface_state(
+        &mut self,
+        ifindex: u32,
+        hour_start_ts_ms: u64,
+        points: Vec<CurrentHourPointState>,
+        now_ms: u64,
+    ) {
+        let (expected_start, expected_end) = hourly_bucket_local(now_ms);
+        if hour_start_ts_ms == expected_start {
+            self.current_hour_iface.insert(ifindex, (hour_start_ts_ms, points));
+        }
+    }
+
+    pub fn restore_current_hour_device_state(
+        &mut self,
+        ifindex: u32,
+        mac: String,
+        hour_start_ts_ms: u64,
+        points: Vec<CurrentHourPointState>,
+        now_ms: u64,
+    ) {
+        let (expected_start, expected_end) = hourly_bucket_local(now_ms);
+        let key = DeviceSeriesKey { ifindex, mac };
+        if hour_start_ts_ms == expected_start {
+            self.current_hour_device.insert(key, (hour_start_ts_ms, points));
+        }
+    }
+
+    // 新增：恢复IP当前小时状态
+    pub fn restore_current_hour_ip_state(
+        &mut self,
+        ifindex: u32,
+        ip: String,
+        hour_start_ts_ms: u64,
+        points: Vec<CurrentHourPointState>,
+        now_ms: u64,
+    ) {
+        let (expected_start, expected_end) = hourly_bucket_local(now_ms);
+        let key = IpSeriesKey { ifindex, ip };
+        if hour_start_ts_ms == expected_start {
+            self.current_hour_ip.insert(key, (hour_start_ts_ms, points));
+        }
+    }
+
+    pub fn export_current_hour_state(&self) -> ExportedCurrentHourState {
+        ExportedCurrentHourState {
+            iface: self
+                .current_hour_iface
+                .iter()
+                .map(|(ifindex, (hour_start, points))| ExportedCurrentHourIfaceState {
+                    ifindex: *ifindex,
+                    hour_start_ts_ms: *hour_start,
+                    points: points.clone(),
+                })
+                .collect(),
+            device: self
+                .current_hour_device
+                .iter()
+                .map(|(key, (hour_start, points))| ExportedCurrentHourDeviceState {
+                    ifindex: key.ifindex,
+                    mac: key.mac.clone(),
+                    hour_start_ts_ms: *hour_start,
+                    points: points.clone(),
+                })
+                .collect(),
+            // 新增：导出IP当前小时状态
+            ip: self
+                .current_hour_ip
+                .iter()
+                .map(|(key, (hour_start, points))| ExportedCurrentHourIpState {
+                    ifindex: key.ifindex,
+                    ip: key.ip.clone(),
+                    hour_start_ts_ms: *hour_start,
+                    points: points.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -561,16 +655,20 @@ fn read_device_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<DeviceTrafficKey
 
 // 新增：从 eBPF map 读取IP级流量统计
 fn read_ip_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<IpTrafficKey, TrafficValue>> {
-    let map = ebpf
-        .map_mut("IP_TRAFFIC_STATS")
-        .ok_or_else(|| anyhow::anyhow!("IP_TRAFFIC_STATS map not found"))?;
-    let map: AyaHashMap<_, IpTrafficKey, TrafficValue> = AyaHashMap::try_from(map)?;
-    let mut result = HashMap::new();
-    for entry in map.iter() {
-        let (k, v) = entry?;
-        result.insert(k, v);
+    use aya::maps::HashMap as AyaHashMap;
+    use bandix_plus_common::{IpTrafficKey, TrafficValue};
+
+    let mut ip_stats: HashMap<IpTrafficKey, TrafficValue> = HashMap::new();
+    
+    // 获取IP_TRAFFIC_STATS映射
+    if let Ok(mut map) = AyaHashMap::<&mut aya::Ebpf, IpTrafficKey, TrafficValue>::try_from(ebpf.map_mut("IP_TRAFFIC_STATS")?) {
+        for result in map.iter() {
+            let (key, value) = result?;
+            ip_stats.insert(key, value);
+        }
     }
-    Ok(result)
+    
+    Ok(ip_stats)
 }
 
 /// 根据 IP 版本和方向填充四元组，bytes 存增量
@@ -651,40 +749,60 @@ fn build_ip_list(
     topology: &TopologySnapshot,
     sec: f64,
 ) -> Vec<IpListItem> {
-    let mut ip_map: HashMap<(u32, String), (CounterQuad, u64)> = HashMap::new(); // (metrics, total_bytes)
+    let mut ip_map: HashMap<String, IpListItem> = HashMap::new();
 
-    for (key, value) in ip_stats {
-        if !monitor_ifaces.is_empty() && topology.by_ifindex(key.ifindex).map_or(true, |iface| !monitor_ifaces.contains(iface.name.as_str())) {
+    for (k, v) in ip_stats {
+        // 检查接口是否在监控范围内
+        let iface_name = topology.by_ifindex(k.ifindex).map(|info| &info.name[..]).unwrap_or("");
+        if !monitor_ifaces.is_empty() && !monitor_ifaces.contains(iface_name) {
             continue;
         }
 
-        let ip_str = ip_to_string(key.ip_addr);
-        let entry = ip_map.entry((key.ifindex, ip_str)).or_default();
-        let prev = runtime.prev_ip_bytes.get(key).copied().unwrap_or(0);
-        let delta = delta_bytes(value.bytes, prev);
-        runtime.prev_ip_bytes.insert(*key, value.bytes);
-        fill_quad_for_ip(key.ip_version, key.direction, &mut entry.0, delta, sec);
-        entry.1 += delta;
-    }
+        // 将IP地址转换回字符串形式
+        let ip_str = if k.ip_version == 4 {
+            // IPv4地址存储在前4个字节
+            format!("{}.{}.{}.{}", k.ip_addr[0], k.ip_addr[1], k.ip_addr[2], k.ip_addr[3])
+        } else {
+            // IPv6地址使用全部16个字节
+            format!(
+                "{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
+                k.ip_addr[0], k.ip_addr[1], k.ip_addr[2], k.ip_addr[3],
+                k.ip_addr[4], k.ip_addr[5], k.ip_addr[6], k.ip_addr[7],
+                k.ip_addr[8], k.ip_addr[9], k.ip_addr[10], k.ip_addr[11],
+                k.ip_addr[12], k.ip_addr[13], k.ip_addr[14], k.ip_addr[15]
+            )
+        };
 
-    let mut result = Vec::new();
-    for ((ifindex, ip_str), (metrics, _total_bytes)) in ip_map {
-        let iface_name = topology.by_ifindex(ifindex).map(|iface| iface.name.clone()).unwrap_or_else(|| "unknown".to_string());
-        
-        let cum = runtime.cumulative_ip.entry((ifindex, ip_str.clone())).or_default();
+        let key = (k.ifindex, ip_str.clone());
+        let prev = runtime.prev_ip_bytes.get(&k).copied().unwrap_or(0);
+        let delta = delta_bytes(v.bytes, prev);
+        runtime.prev_ip_bytes.insert(*k, v.bytes);
+
+        let mut metrics = CounterQuad::default();
+        fill_quad(
+            if k.ip_version == 4 { IpVersion::V4 } else { IpVersion::V6 },
+            if k.direction == 1 { TrafficDirection::Ingress } else { TrafficDirection::Egress },
+            &mut metrics,
+            delta,
+            sec,
+        );
+
+        let cum = runtime.cumulative_ip.entry(key.clone()).or_default();
         add_quad(cum, &metrics);
 
-        result.push(IpListItem {
-            ifindex,
-            ifname: iface_name,
+        let ip_item = IpListItem {
+            ifindex: k.ifindex,
+            ifname: iface_name.to_string(),
             ip_addr: ip_str,
-            ip_version: if ip_str.contains(':') { 6 } else { 4 },
+            ip_version: k.ip_version,
             metrics,
             cumulative: *cum,
-        });
+        };
+
+        ip_map.insert(format!("{}-{}", k.ifindex, ip_str), ip_item);
     }
 
-    result
+    ip_map.into_values().collect()
 }
 
 pub fn build_snapshot(
@@ -1247,4 +1365,34 @@ impl TrafficHistory {
             })
             .collect()
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportedCurrentHourIpState {
+    pub ifindex: u32,
+    pub ip: String,
+    pub hour_start_ts_ms: u64,
+    pub points: Vec<CurrentHourPointState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportedCurrentHourState {
+    pub iface: Vec<ExportedCurrentHourIfaceState>,
+    pub device: Vec<ExportedCurrentHourDeviceState>,
+    pub ip: Vec<ExportedCurrentHourIpState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportedCurrentHourIfaceState {
+    pub ifindex: u32,
+    pub hour_start_ts_ms: u64,
+    pub points: Vec<CurrentHourPointState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExportedCurrentHourDeviceState {
+    pub ifindex: u32,
+    pub mac: String,
+    pub hour_start_ts_ms: u64,
+    pub points: Vec<CurrentHourPointState>,
 }
