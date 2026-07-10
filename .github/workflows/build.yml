@@ -18,6 +18,11 @@ jobs:
   build_bandix-plus:
     name: Check Version
     runs-on: ubuntu-24.04
+    
+    # ⬇️ 核心修复：在这里显式声明需要对仓库内容的写权限，用于创建 Release
+    permissions:
+      contents: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@main
@@ -48,8 +53,6 @@ jobs:
           else
             echo "has_update=true" >> $GITHUB_OUTPUT
           fi
-
-
 
       - name: Install dependencies
         id: install_dependencies
