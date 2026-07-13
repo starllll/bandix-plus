@@ -127,6 +127,48 @@ fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
         bump_device_counter(&device_key, pkt_len);
     }
 
+    if let Some(src_ip) = meta.src_ip {
+        if meta.ip_version == IpVersion::V4 as u8 {
+            let key = Ipv4TrafficKey {
+                ifindex,
+                ip: [src_ip[0], src_ip[1], src_ip[2], src_ip[3]],
+                ip_version: meta.ip_version,
+                direction,
+                _pad: [0; 2],
+            };
+            bump_ipv4_counter(&key, pkt_len);
+        } else {
+            let key = Ipv6TrafficKey {
+                ifindex,
+                ip: src_ip,
+                ip_version: meta.ip_version,
+                direction,
+            };
+            bump_ipv6_counter(&key, pkt_len);
+        }
+    }
+
+    if let Some(dst_ip) = meta.dst_ip {
+        if meta.ip_version == IpVersion::V4 as u8 {
+            let key = Ipv4TrafficKey {
+                ifindex,
+                ip: [dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]],
+                ip_version: meta.ip_version,
+                direction,
+                _pad: [0; 2],
+            };
+            bump_ipv4_counter(&key, pkt_len);
+        } else {
+            let key = Ipv6TrafficKey {
+                ifindex,
+                ip: dst_ip,
+                ip_version: meta.ip_version,
+                direction,
+            };
+            bump_ipv6_counter(&key, pkt_len);
+        }
+    }
+
     if should_drop_by_rate_limit(ifindex, meta.mac, meta.ip_version, direction, pkt_len) {
         return Ok(TC_ACT_SHOT);
     }
@@ -144,13 +186,37 @@ fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
                 }
                 _ => Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_dest)) }),
             };
-            return Some(PacketMeta { ip_version, mac, src_ip: None, dst_ip: None });
+            let src_ip = if eth_proto == ETH_P_IP {
+                resolve_ipv4_only(ctx, core::mem::size_of::<EthHdr>() + 12)
+            } else if eth_proto == ETH_P_IPV6 {
+                resolve_ipv6_only(ctx, core::mem::size_of::<EthHdr>() + 8)
+            } else {
+                None
+            };
+            let dst_ip = if eth_proto == ETH_P_IP {
+                resolve_ipv4_only(ctx, core::mem::size_of::<EthHdr>() + 16)
+            } else if eth_proto == ETH_P_IPV6 {
+                resolve_ipv6_only(ctx, core::mem::size_of::<EthHdr>() + 24)
+            } else {
+                None
+            };
+            return Some(PacketMeta { ip_version, mac, src_ip, dst_ip });
         }
     }
 
     // L3-style interfaces (e.g. ppp/tun/wireguard) may have no Ethernet header.
     if let Some(ip_version) = resolve_ip_version_from_l3(ctx, 0) {
-        return Some(PacketMeta { ip_version, mac: None, src_ip: None, dst_ip: None });
+        let src_ip = if ip_version == IpVersion::V4 as u8 {
+            resolve_ipv4_only(ctx, 12)
+        } else {
+            resolve_ipv6_only(ctx, 8)
+        };
+        let dst_ip = if ip_version == IpVersion::V4 as u8 {
+            resolve_ipv4_only(ctx, 16)
+        } else {
+            resolve_ipv6_only(ctx, 24)
+        };
+        return Some(PacketMeta { ip_version, mac: None, src_ip, dst_ip });
     }
     if let Some(ip_version) = resolve_ip_version_from_ppp(ctx) {
         return Some(PacketMeta { ip_version, mac: None, src_ip: None, dst_ip: None });
@@ -210,6 +276,19 @@ fn ptr_at<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
         return Err(());
     }
     Ok((start + offset) as *const T)
+}
+
+fn resolve_ipv4_only(ctx: &TcContext, offset: usize) -> Option<[u8; 16]> {
+    let ip_ptr = ptr_at::<[u8; 4]>(ctx, offset).ok()?;
+    let bytes = unsafe { core::ptr::read_unaligned(ip_ptr) };
+    let mut out = [0u8; 16];
+    out[..4].copy_from_slice(&bytes);
+    Some(out)
+}
+
+fn resolve_ipv6_only(ctx: &TcContext, offset: usize) -> Option<[u8; 16]> {
+    let ip_ptr = ptr_at::<[u8; 16]>(ctx, offset).ok()?;
+    Some(unsafe { core::ptr::read_unaligned(ip_ptr) })
 }
 
 fn bump_iface_counter(key: &InterfaceTrafficKey, bytes: u64) {
