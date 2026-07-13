@@ -127,48 +127,6 @@ fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
         bump_device_counter(&device_key, pkt_len);
     }
 
-    if let Some(src_ip) = meta.src_ip {
-        if meta.ip_version == IpVersion::V4 as u8 {
-            let key = Ipv4TrafficKey {
-                ifindex,
-                ip: [src_ip[0], src_ip[1], src_ip[2], src_ip[3]],
-                ip_version: meta.ip_version,
-                direction,
-                _pad: [0; 2],
-            };
-            bump_ipv4_counter(&key, pkt_len);
-        } else {
-            let key = Ipv6TrafficKey {
-                ifindex,
-                ip: src_ip,
-                ip_version: meta.ip_version,
-                direction,
-            };
-            bump_ipv6_counter(&key, pkt_len);
-        }
-    }
-
-    if let Some(dst_ip) = meta.dst_ip {
-        if meta.ip_version == IpVersion::V4 as u8 {
-            let key = Ipv4TrafficKey {
-                ifindex,
-                ip: [dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]],
-                ip_version: meta.ip_version,
-                direction,
-                _pad: [0; 2],
-            };
-            bump_ipv4_counter(&key, pkt_len);
-        } else {
-            let key = Ipv6TrafficKey {
-                ifindex,
-                ip: dst_ip,
-                ip_version: meta.ip_version,
-                direction,
-            };
-            bump_ipv6_counter(&key, pkt_len);
-        }
-    }
-
     if should_drop_by_rate_limit(ifindex, meta.mac, meta.ip_version, direction, pkt_len) {
         return Ok(TC_ACT_SHOT);
     }
@@ -177,56 +135,25 @@ fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
 }
 
 fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
-    let eth_proto = ctx.load::<u16>(12).ok()?;
-    let eth_proto = u16::from_be(eth_proto);
-    if let Some(ip_version) = resolve_ip_version_from_eth(ctx, eth_proto) {
-        let mac = match direction {
-            x if x == TrafficDirection::Ingress as u8 => ctx.load::<[u8; 6]>(6).ok(),
-            _ => ctx.load::<[u8; 6]>(0).ok(),
-        };
-        let src_ip = if eth_proto == ETH_P_IP {
-            resolve_ipv4_only(ctx, 14 + 12)
-        } else if eth_proto == ETH_P_IPV6 {
-            resolve_ipv6_only(ctx, 14 + 8)
-        } else {
-            None
-        };
-        let dst_ip = if eth_proto == ETH_P_IP {
-            resolve_ipv4_only(ctx, 14 + 16)
-        } else if eth_proto == ETH_P_IPV6 {
-            resolve_ipv6_only(ctx, 14 + 24)
-        } else {
-            None
-        };
-        return Some(PacketMeta { ip_version, mac, src_ip, dst_ip });
+    if let Ok(eth) = ptr_at::<EthHdr>(ctx, 0) {
+        let eth_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_proto)) });
+        if let Some(ip_version) = resolve_ip_version_from_eth(ctx, eth_proto) {
+            let mac = match direction {
+                x if x == TrafficDirection::Ingress as u8 => {
+                    Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_source)) })
+                }
+                _ => Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_dest)) }),
+            };
+            return Some(PacketMeta { ip_version, mac, src_ip: None, dst_ip: None });
+        }
     }
 
     // L3-style interfaces (e.g. ppp/tun/wireguard) may have no Ethernet header.
     if let Some(ip_version) = resolve_ip_version_from_l3(ctx, 0) {
-        let src_ip = if ip_version == IpVersion::V4 as u8 {
-            resolve_ipv4_only(ctx, 12)
-        } else {
-            resolve_ipv6_only(ctx, 8)
-        };
-        let dst_ip = if ip_version == IpVersion::V4 as u8 {
-            resolve_ipv4_only(ctx, 16)
-        } else {
-            resolve_ipv6_only(ctx, 24)
-        };
-        return Some(PacketMeta { ip_version, mac: None, src_ip, dst_ip });
+        return Some(PacketMeta { ip_version, mac: None, src_ip: None, dst_ip: None });
     }
     if let Some(ip_version) = resolve_ip_version_from_ppp(ctx) {
-        let src_ip = if ip_version == IpVersion::V4 as u8 {
-            resolve_ipv4_only(ctx, 2 + 12)
-        } else {
-            resolve_ipv6_only(ctx, 2 + 8)
-        };
-        let dst_ip = if ip_version == IpVersion::V4 as u8 {
-            resolve_ipv4_only(ctx, 2 + 16)
-        } else {
-            resolve_ipv6_only(ctx, 2 + 24)
-        };
-        return Some(PacketMeta { ip_version, mac: None, src_ip, dst_ip });
+        return Some(PacketMeta { ip_version, mac: None, src_ip: None, dst_ip: None });
     }
     None
 }
@@ -236,8 +163,8 @@ fn resolve_ip_version_from_eth(ctx: &TcContext, eth_proto: u16) -> Option<u8> {
         ETH_P_IP => Some(IpVersion::V4 as u8),
         ETH_P_IPV6 => Some(IpVersion::V6 as u8),
         ETH_P_PPP_SES => {
-            let ppp_proto = ctx.load::<u16>(14 + 4).ok()?;
-            let ppp_proto = u16::from_be(ppp_proto);
+            let pppoe = ptr_at::<PppoeSessionHdr>(ctx, core::mem::size_of::<EthHdr>()).ok()?;
+            let ppp_proto = u16::from_be(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*pppoe).ppp_proto)) });
             match ppp_proto {
                 PPP_PROTO_IP => Some(IpVersion::V4 as u8),
                 PPP_PROTO_IPV6 => Some(IpVersion::V6 as u8),
@@ -249,8 +176,8 @@ fn resolve_ip_version_from_eth(ctx: &TcContext, eth_proto: u16) -> Option<u8> {
 }
 
 fn resolve_ip_version_from_l3(ctx: &TcContext, offset: usize) -> Option<u8> {
-    let first2 = ctx.load::<u16>(offset).ok()?;
-    let first2 = u16::from_be(first2);
+    let first2 = ptr_at::<u16>(ctx, offset).ok()?;
+    let first2 = u16::from_be(unsafe { core::ptr::read_unaligned(first2) });
     let version = (first2 >> 12) as u8;
     match version {
         4 => Some(IpVersion::V4 as u8),
@@ -260,15 +187,29 @@ fn resolve_ip_version_from_l3(ctx: &TcContext, offset: usize) -> Option<u8> {
 }
 
 fn resolve_ip_version_from_ppp(ctx: &TcContext) -> Option<u8> {
-    let proto = ctx.load::<u16>(0).ok()?;
-    let proto = u16::from_be(proto);
-    match proto {
-        PPP_PROTO_IP => return Some(IpVersion::V4 as u8),
-        PPP_PROTO_IPV6 => return Some(IpVersion::V6 as u8),
-        _ => {}
+    if let Ok(proto_ptr) = ptr_at::<u16>(ctx, 0) {
+        let proto = u16::from_be(unsafe { core::ptr::read_unaligned(proto_ptr) });
+        match proto {
+            PPP_PROTO_IP => return Some(IpVersion::V4 as u8),
+            PPP_PROTO_IPV6 => return Some(IpVersion::V6 as u8),
+            _ => {}
+        }
+        // Protocol field + L3 payload.
+        if let Some(ip_version) = resolve_ip_version_from_l3(ctx, 2) {
+            return Some(ip_version);
+        }
     }
-    // Protocol field + L3 payload.
-    resolve_ip_version_from_l3(ctx, 2)
+    None
+}
+
+fn ptr_at<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
+    let start = ctx.data();
+    let end = ctx.data_end();
+    let len = core::mem::size_of::<T>();
+    if start + offset + len > end {
+        return Err(());
+    }
+    Ok((start + offset) as *const T)
 }
 
 fn bump_iface_counter(key: &InterfaceTrafficKey, bytes: u64) {
@@ -321,17 +262,6 @@ fn bump_ipv6_counter(key: &Ipv6TrafficKey, bytes: u64) {
         let value = TrafficValue { packets: 1, bytes };
         let _ = IPV6_TRAFFIC_STATS.insert(key, &value, 0);
     }
-}
-
-fn resolve_ipv4_only(ctx: &TcContext, offset: usize) -> Option<[u8; 16]> {
-    let bytes = ctx.load::<[u8; 4]>(offset).ok()?;
-    let mut out = [0u8; 16];
-    out[..4].copy_from_slice(&bytes);
-    Some(out)
-}
-
-fn resolve_ipv6_only(ctx: &TcContext, offset: usize) -> Option<[u8; 16]> {
-    ctx.load::<[u8; 16]>(offset).ok()
 }
 
 fn should_drop_by_rate_limit(ifindex: u32, mac: Option<[u8; 6]>, ip_version: u8, direction: u8, pkt_len: u64) -> bool {
