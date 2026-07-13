@@ -69,10 +69,7 @@ async fn run_service(options: &Options) -> anyhow::Result<()> {
         );
     }
     log::info!("persistence data dir={}", persistence.data_dir().display());
-    log::info!(
-        "traffic persistence enabled={}",
-        options.traffic_enable_storage
-    );
+    log::info!("traffic persistence enabled={}", options.traffic_enable_storage);
 
     let policy = parse_policy();
 
@@ -296,12 +293,8 @@ fn validate_arguments(options: &Options) -> anyhow::Result<()> {
                 }
             }
             _ => {
-                if options.tcx_anchor_ingress_id.is_some()
-                    || options.tcx_anchor_egress_id.is_some()
-                {
-                    anyhow::bail!(
-                        "--tcx-anchor-ingress-id and --tcx-anchor-egress-id can only be used when --tc-order is before/after"
-                    );
+                if options.tcx_anchor_ingress_id.is_some() || options.tcx_anchor_egress_id.is_some() {
+                    anyhow::bail!("--tcx-anchor-ingress-id and --tcx-anchor-egress-id can only be used when --tc-order is before/after");
                 }
             }
         }

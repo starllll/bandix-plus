@@ -71,7 +71,11 @@ pub struct Options {
     )]
     pub log_level: String,
 
-    #[arg(long, default_value = "default", help = "TC order: first, default, last, before, after")]
+    #[arg(
+        long,
+        default_value = "default",
+        help = "TC order: first, default, last, before, after"
+    )]
     pub tc_order: String,
 
     #[arg(

@@ -3,9 +3,12 @@ use std::time::Duration;
 
 use aya::Ebpf;
 use aya::maps::HashMap as AyaHashMap;
-use bandix_plus_common::{DeviceTrafficKey, InterfaceTrafficKey, Ipv4TrafficKey, Ipv6TrafficKey, IpVersion, TrafficDirection, TrafficValue};
+use bandix_plus_common::{
+    DeviceTrafficKey, InterfaceTrafficKey, IpVersion, Ipv4TrafficKey, Ipv6TrafficKey, TrafficDirection, TrafficValue,
+};
 use chrono::{Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::topology::TopologySnapshot;
 use crate::utils::mac_utils;
@@ -53,6 +56,7 @@ pub struct MonitorRuntime {
     pub cumulative_ipv6: HashMap<(u32, [u8; 16]), CounterQuad>,
     pub last_snapshot_ms: Option<u64>,
     pub device_registry: DeviceRegistry,
+    pub tailscale_identity_ips: Vec<String>,
 }
 
 pub fn export_runtime_state(runtime: &MonitorRuntime, topology: &TopologySnapshot) -> MonitorRuntimeState {
@@ -1039,6 +1043,7 @@ pub fn collect_snapshot(
     let monitor_set: HashSet<_> = monitor_ifaces.iter().map(String::as_str).collect();
     let iface_infos = system_utils::list_interfaces()?;
     let ifindex_by_name: HashMap<_, _> = iface_infos.iter().map(|x| (x.name.as_str(), x.ifindex)).collect();
+    let iface_info_by_ifindex: HashMap<_, _> = iface_infos.iter().map(|x| (x.ifindex, x)).collect();
 
     let mut interfaces = Vec::new();
     let mut seen_iface_names = HashSet::new();
@@ -1096,6 +1101,8 @@ pub fn collect_snapshot(
         }
         entry.2 = pick_best_neighbor_state(entry.2.as_str(), &n.state);
     }
+
+    let tailscale_identity_ips = resolve_tailscale_identity_ips(runtime);
 
     let mut devices_group: HashMap<(u32, [u8; 6]), DeviceListItem> = HashMap::new();
     let mut ip_devices_group: HashMap<(u32, String), DeviceListItem> = HashMap::new();
@@ -1166,48 +1173,74 @@ pub fn collect_snapshot(
     }
 
     for (k, v) in &ipv4_stats {
-        let ip_key = format!("{}:{}", k.ifindex, ip_to_string(&k.ip));
-        let entry = ip_devices_group.entry((k.ifindex, ip_key)).or_insert_with(|| DeviceListItem {
-            ifindex: k.ifindex,
-            logical_iface: topology.by_ifindex(k.ifindex).map(|iface| iface.name.clone()).unwrap_or_default(),
-            subnet: "-".to_string(),
-            ipv4: vec![ip_to_string(&k.ip)],
-            ipv6: Vec::new(),
-            mac: "".to_string(),
-            hostname: "-".to_string(),
-            metrics: CounterQuad::default(),
-            cumulative: CounterQuad::default(),
-            online: true,
-            identity_type: "ip".to_string(),
-            last_seen_ms: now_ms,
-            neighbor_state: None,
-        });
-        let prev = runtime.prev_ipv4_bytes.get(k).copied().unwrap_or(0);
+        if !iface_info_by_ifindex
+            .get(&k.ifindex)
+            .is_some_and(|iface| should_use_ip_identity_for_iface(iface))
+        {
+            continue;
+        }
+
+        let canonical_key = canonicalize_ipv4_key(k, &tailscale_identity_ips);
+        let ip_key = format!("{}:{}", canonical_key.ifindex, ip_to_string(&canonical_key.ip));
+        let entry = ip_devices_group
+            .entry((canonical_key.ifindex, ip_key))
+            .or_insert_with(|| DeviceListItem {
+                ifindex: canonical_key.ifindex,
+                logical_iface: topology
+                    .by_ifindex(canonical_key.ifindex)
+                    .map(|iface| iface.name.clone())
+                    .unwrap_or_default(),
+                subnet: "-".to_string(),
+                ipv4: vec![ip_to_string(&canonical_key.ip)],
+                ipv6: Vec::new(),
+                mac: "".to_string(),
+                hostname: "-".to_string(),
+                metrics: CounterQuad::default(),
+                cumulative: CounterQuad::default(),
+                online: true,
+                identity_type: "ip".to_string(),
+                last_seen_ms: now_ms,
+                neighbor_state: None,
+            });
+        let prev = runtime.prev_ipv4_bytes.get(&canonical_key).copied().unwrap_or(0);
         let delta = delta_bytes(v.bytes, prev);
-        runtime.prev_ipv4_bytes.insert(*k, v.bytes);
+        runtime.prev_ipv4_bytes.insert(canonical_key, v.bytes);
         fill_quad(k.ip_version, k.direction, &mut entry.metrics, delta, sec);
     }
 
     for (k, v) in &ipv6_stats {
-        let ip_key = format!("{}:{}", k.ifindex, ip_to_string(&k.ip));
-        let entry = ip_devices_group.entry((k.ifindex, ip_key)).or_insert_with(|| DeviceListItem {
-            ifindex: k.ifindex,
-            logical_iface: topology.by_ifindex(k.ifindex).map(|iface| iface.name.clone()).unwrap_or_default(),
-            subnet: "-".to_string(),
-            ipv4: Vec::new(),
-            ipv6: vec![ip_to_string(&k.ip)],
-            mac: "".to_string(),
-            hostname: "-".to_string(),
-            metrics: CounterQuad::default(),
-            cumulative: CounterQuad::default(),
-            online: true,
-            identity_type: "ip".to_string(),
-            last_seen_ms: now_ms,
-            neighbor_state: None,
-        });
-        let prev = runtime.prev_ipv6_bytes.get(k).copied().unwrap_or(0);
+        if !iface_info_by_ifindex
+            .get(&k.ifindex)
+            .is_some_and(|iface| should_use_ip_identity_for_iface(iface))
+        {
+            continue;
+        }
+
+        let canonical_key = canonicalize_ipv6_key(k, &tailscale_identity_ips);
+        let ip_key = format!("{}:{}", canonical_key.ifindex, ip_to_string(&canonical_key.ip));
+        let entry = ip_devices_group
+            .entry((canonical_key.ifindex, ip_key))
+            .or_insert_with(|| DeviceListItem {
+                ifindex: canonical_key.ifindex,
+                logical_iface: topology
+                    .by_ifindex(canonical_key.ifindex)
+                    .map(|iface| iface.name.clone())
+                    .unwrap_or_default(),
+                subnet: "-".to_string(),
+                ipv4: Vec::new(),
+                ipv6: vec![ip_to_string(&canonical_key.ip)],
+                mac: "".to_string(),
+                hostname: "-".to_string(),
+                metrics: CounterQuad::default(),
+                cumulative: CounterQuad::default(),
+                online: true,
+                identity_type: "ip".to_string(),
+                last_seen_ms: now_ms,
+                neighbor_state: None,
+            });
+        let prev = runtime.prev_ipv6_bytes.get(&canonical_key).copied().unwrap_or(0);
         let delta = delta_bytes(v.bytes, prev);
-        runtime.prev_ipv6_bytes.insert(*k, v.bytes);
+        runtime.prev_ipv6_bytes.insert(canonical_key, v.bytes);
         fill_quad(k.ip_version, k.direction, &mut entry.metrics, delta, sec);
     }
 
@@ -1315,6 +1348,153 @@ fn ip_to_string(bytes: &[u8]) -> String {
     } else {
         std::net::Ipv6Addr::from(bytes.try_into().unwrap_or([0u8; 16])).to_string()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefers_ipv4_tailscale_identity_when_present() {
+        let ips = vec!["100.64.0.2".to_string(), "fd7a:115c:a1e0::2".to_string()];
+
+        assert_eq!(
+            preferred_tailscale_identity_for_family(&ips, true),
+            Some("100.64.0.2".to_string())
+        );
+        assert_eq!(
+            preferred_tailscale_identity_for_family(&ips, false),
+            Some("fd7a:115c:a1e0::2".to_string())
+        );
+    }
+
+    #[test]
+    fn extracts_tailscale_ips_from_status_json() {
+        let json = r#"{"Self":{"TailscaleIPs":["100.64.0.2","fd7a:115c:a1e0::2"]}}"#;
+        let mut ips = Vec::new();
+        collect_tailscale_ip_strings_from_json(json, &mut ips);
+
+        assert!(ips.contains(&"100.64.0.2".to_string()));
+        assert!(ips.contains(&"fd7a:115c:a1e0::2".to_string()));
+    }
+
+    #[test]
+    fn only_uses_ip_identity_for_virtual_interfaces_without_mac() {
+        let iface_with_mac = system_utils::InterfaceInfo {
+            ifindex: 1,
+            name: "eth0".to_string(),
+            mac: Some("aa:bb:cc:dd:ee:ff".to_string()),
+            operstate: None,
+            mtu: None,
+            flags: None,
+            ipv4: Vec::new(),
+            ipv6: Vec::new(),
+            role: system_utils::InterfaceRole::Ethernet,
+        };
+        let iface_without_mac = system_utils::InterfaceInfo {
+            ifindex: 2,
+            name: "tailscale0".to_string(),
+            mac: None,
+            operstate: None,
+            mtu: None,
+            flags: None,
+            ipv4: Vec::new(),
+            ipv6: Vec::new(),
+            role: system_utils::InterfaceRole::Tun,
+        };
+
+        assert!(!should_use_ip_identity_for_iface(&iface_with_mac));
+        assert!(should_use_ip_identity_for_iface(&iface_without_mac));
+    }
+}
+
+fn resolve_tailscale_identity_ips(runtime: &mut MonitorRuntime) -> Vec<String> {
+    if !runtime.tailscale_identity_ips.is_empty() {
+        return runtime.tailscale_identity_ips.clone();
+    }
+
+    let mut ips = Vec::new();
+    if let Ok(output) = std::process::Command::new("tailscale").arg("status").arg("--json").output() {
+        if output.status.success() {
+            collect_tailscale_ip_strings_from_json(&String::from_utf8_lossy(&output.stdout), &mut ips);
+        }
+    }
+
+    runtime.tailscale_identity_ips = ips.clone();
+    ips
+}
+
+fn collect_tailscale_ip_strings_from_json(output: &str, ips: &mut Vec<String>) {
+    if let Ok(value) = serde_json::from_str::<Value>(output) {
+        if let Some(self_value) = value.get("Self") {
+            if let Some(tailscale_ips) = self_value.get("TailscaleIPs").and_then(Value::as_array) {
+                for ip in tailscale_ips {
+                    if let Some(ip) = ip.as_str() {
+                        if !ips.contains(&ip.to_string()) {
+                            ips.push(ip.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn canonicalize_ipv4_key(key: &Ipv4TrafficKey, tailscale_identity_ips: &HashSet<String>) -> Ipv4TrafficKey {
+    let mut ip = key.ip;
+    if let Some(identity) = preferred_tailscale_identity_for_family(tailscale_identity_ips, true) {
+        if let Ok(addr) = identity.parse::<std::net::Ipv4Addr>() {
+            ip = addr.octets();
+        }
+    }
+    Ipv4TrafficKey {
+        ifindex: key.ifindex,
+        ip,
+        ip_version: key.ip_version,
+        direction: key.direction,
+        _pad: key._pad,
+    }
+}
+
+fn canonicalize_ipv6_key(key: &Ipv6TrafficKey, tailscale_identity_ips: &HashSet<String>) -> Ipv6TrafficKey {
+    let mut ip = key.ip;
+    if let Some(identity) = preferred_tailscale_identity_for_family(tailscale_identity_ips, false) {
+        if let Ok(addr) = identity.parse::<std::net::Ipv6Addr>() {
+            ip = addr.octets();
+        }
+    }
+    Ipv6TrafficKey {
+        ifindex: key.ifindex,
+        ip,
+        ip_version: key.ip_version,
+        direction: key.direction,
+    }
+}
+
+fn preferred_tailscale_identity_for_family(tailscale_identity_ips: &[String], ipv4: bool) -> Option<String> {
+    tailscale_identity_ips.iter().find_map(|ip| {
+        let is_family_match = if ipv4 {
+            ip.parse::<std::net::Ipv4Addr>().is_ok()
+        } else {
+            ip.parse::<std::net::Ipv6Addr>().is_ok()
+        };
+        is_family_match.then(|| ip.clone())
+    })
+}
+
+fn should_use_ip_identity_for_iface(iface: &system_utils::InterfaceInfo) -> bool {
+    let has_real_mac = iface.mac.as_deref().is_some_and(|mac| !mac.trim().is_empty());
+    if has_real_mac {
+        return false;
+    }
+
+    let name = iface.name.to_ascii_lowercase();
+    matches!(iface.role, system_utils::InterfaceRole::Tun)
+        || name.contains("tailscale")
+        || name.contains("wg")
+        || name.contains("tun")
+        || name.contains("tap")
+        || name.contains("utun")
 }
 
 fn read_iface_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<InterfaceTrafficKey, TrafficValue>> {

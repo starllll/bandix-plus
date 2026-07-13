@@ -999,10 +999,7 @@ async fn set_guest_default_handler(
 }
 
 async fn delete_guest_default_handler(State(state): State<ApiState>, Path(iface): Path<String>) -> Json<ApiEnvelope<&'static str>> {
-    info!(
-        "api DELETE /api/rate_limit/guest_defaults/{iface} call iface={}",
-        iface
-    );
+    info!("api DELETE /api/rate_limit/guest_defaults/{iface} call iface={}", iface);
     let result = {
         let mut guard = state.policy_runtime.write().await;
         delete_guest_default(&mut guard, &iface)

@@ -9,8 +9,8 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use bandix_plus_common::{
-    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, InterfaceTrafficKey, Ipv4TrafficKey,
-    Ipv6TrafficKey, IpVersion, RateBucketValue, RateLimitValue, TrafficDirection, TrafficValue,
+    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, InterfaceTrafficKey, IpVersion, Ipv4TrafficKey,
+    Ipv6TrafficKey, RateBucketValue, RateLimitValue, TrafficDirection, TrafficValue,
 };
 
 const ETH_P_IP: u16 = 0x0800;
@@ -200,7 +200,12 @@ fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
             } else {
                 None
             };
-            return Some(PacketMeta { ip_version, mac, src_ip, dst_ip });
+            return Some(PacketMeta {
+                ip_version,
+                mac,
+                src_ip,
+                dst_ip,
+            });
         }
     }
 
@@ -216,10 +221,20 @@ fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
         } else {
             resolve_ipv6_only(ctx, 24)
         };
-        return Some(PacketMeta { ip_version, mac: None, src_ip, dst_ip });
+        return Some(PacketMeta {
+            ip_version,
+            mac: None,
+            src_ip,
+            dst_ip,
+        });
     }
     if let Some(ip_version) = resolve_ip_version_from_ppp(ctx) {
-        return Some(PacketMeta { ip_version, mac: None, src_ip: None, dst_ip: None });
+        return Some(PacketMeta {
+            ip_version,
+            mac: None,
+            src_ip: None,
+            dst_ip: None,
+        });
     }
     None
 }
