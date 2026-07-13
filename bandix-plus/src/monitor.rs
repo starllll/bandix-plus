@@ -1440,7 +1440,7 @@ fn collect_tailscale_ip_strings_from_json(output: &str, ips: &mut Vec<String>) {
     }
 }
 
-fn canonicalize_ipv4_key(key: &Ipv4TrafficKey, tailscale_identity_ips: &HashSet<String>) -> Ipv4TrafficKey {
+fn canonicalize_ipv4_key(key: &Ipv4TrafficKey, tailscale_identity_ips: &[String]) -> Ipv4TrafficKey {
     let mut ip = key.ip;
     if let Some(identity) = preferred_tailscale_identity_for_family(tailscale_identity_ips, true) {
         if let Ok(addr) = identity.parse::<std::net::Ipv4Addr>() {
@@ -1456,7 +1456,7 @@ fn canonicalize_ipv4_key(key: &Ipv4TrafficKey, tailscale_identity_ips: &HashSet<
     }
 }
 
-fn canonicalize_ipv6_key(key: &Ipv6TrafficKey, tailscale_identity_ips: &HashSet<String>) -> Ipv6TrafficKey {
+fn canonicalize_ipv6_key(key: &Ipv6TrafficKey, tailscale_identity_ips: &[String]) -> Ipv6TrafficKey {
     let mut ip = key.ip;
     if let Some(identity) = preferred_tailscale_identity_for_family(tailscale_identity_ips, false) {
         if let Ok(addr) = identity.parse::<std::net::Ipv6Addr>() {
