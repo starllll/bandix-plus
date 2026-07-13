@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use aya::Ebpf;
 use aya::maps::HashMap as AyaHashMap;
-use bandix_plus_common::{DeviceTrafficKey, InterfaceTrafficKey, IpVersion, TrafficDirection, TrafficValue};
+use bandix_plus_common::{DeviceTrafficKey, InterfaceTrafficKey, Ipv4TrafficKey, Ipv6TrafficKey, IpVersion, TrafficDirection, TrafficValue};
 use chrono::{Local, TimeZone, Timelike};
 use serde::{Deserialize, Serialize};
 
@@ -45,8 +45,12 @@ pub struct KnownDevice {
 pub struct MonitorRuntime {
     pub prev_iface_bytes: HashMap<InterfaceTrafficKey, u64>,
     pub prev_device_bytes: HashMap<DeviceTrafficKey, u64>,
+    pub prev_ipv4_bytes: HashMap<Ipv4TrafficKey, u64>,
+    pub prev_ipv6_bytes: HashMap<Ipv6TrafficKey, u64>,
     pub cumulative_iface: HashMap<u32, CounterQuad>,
     pub cumulative_device: HashMap<(u32, [u8; 6]), CounterQuad>,
+    pub cumulative_ipv4: HashMap<(u32, [u8; 4]), CounterQuad>,
+    pub cumulative_ipv6: HashMap<(u32, [u8; 16]), CounterQuad>,
     pub last_snapshot_ms: Option<u64>,
     pub device_registry: DeviceRegistry,
 }
@@ -150,6 +154,8 @@ pub struct DeviceListItem {
     pub metrics: CounterQuad,
     pub cumulative: CounterQuad,
     pub online: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub identity_type: String,
     /// Last time this device was observed in a snapshot (Unix epoch ms). Online rows use the current snapshot time.
     pub last_seen_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -992,6 +998,7 @@ pub fn build_recovered_snapshot(runtime: &MonitorRuntime, topology: &TopologySna
             metrics: CounterQuad::default(),
             cumulative: runtime.cumulative_device.get(&(*ifindex, *mac)).copied().unwrap_or_default(),
             online: false,
+            identity_type: "mac".to_string(),
             last_seen_ms: known.last_seen_ms,
             neighbor_state: None,
         });
@@ -1035,6 +1042,8 @@ pub fn collect_snapshot(
 
     let mut interfaces = Vec::new();
     let mut seen_iface_names = HashSet::new();
+    let ipv4_stats = read_ipv4_stats(ebpf)?;
+    let ipv6_stats = read_ipv6_stats(ebpf)?;
     for iface_name in monitor_ifaces {
         if !seen_iface_names.insert(iface_name.as_str()) {
             continue;
@@ -1089,6 +1098,7 @@ pub fn collect_snapshot(
     }
 
     let mut devices_group: HashMap<(u32, [u8; 6]), DeviceListItem> = HashMap::new();
+    let mut ip_devices_group: HashMap<(u32, String), DeviceListItem> = HashMap::new();
     for ((dev, mac), (ipv4_list, ipv6_list, best_state)) in dev_mac_to_ips {
         let Some(ifindex) = ifindex_by_name.get(dev.as_str()).copied() else {
             continue;
@@ -1139,6 +1149,7 @@ pub fn collect_snapshot(
                 metrics: CounterQuad::default(),
                 cumulative: CounterQuad::default(),
                 online: true,
+                identity_type: "mac".to_string(),
                 last_seen_ms: now_ms,
                 neighbor_state: Some(best_state.clone()),
             },
@@ -1154,10 +1165,73 @@ pub fn collect_snapshot(
         }
     }
 
+    for (k, v) in &ipv4_stats {
+        let ip_key = format!("{}:{}", k.ifindex, ip_to_string(&k.ip));
+        let entry = ip_devices_group.entry((k.ifindex, ip_key)).or_insert_with(|| DeviceListItem {
+            ifindex: k.ifindex,
+            logical_iface: topology.by_ifindex(k.ifindex).map(|iface| iface.name.clone()).unwrap_or_default(),
+            subnet: "-".to_string(),
+            ipv4: vec![ip_to_string(&k.ip)],
+            ipv6: Vec::new(),
+            mac: "".to_string(),
+            hostname: "-".to_string(),
+            metrics: CounterQuad::default(),
+            cumulative: CounterQuad::default(),
+            online: true,
+            identity_type: "ip".to_string(),
+            last_seen_ms: now_ms,
+            neighbor_state: None,
+        });
+        let prev = runtime.prev_ipv4_bytes.get(k).copied().unwrap_or(0);
+        let delta = delta_bytes(v.bytes, prev);
+        runtime.prev_ipv4_bytes.insert(*k, v.bytes);
+        fill_quad(k.ip_version, k.direction, &mut entry.metrics, delta, sec);
+    }
+
+    for (k, v) in &ipv6_stats {
+        let ip_key = format!("{}:{}", k.ifindex, ip_to_string(&k.ip));
+        let entry = ip_devices_group.entry((k.ifindex, ip_key)).or_insert_with(|| DeviceListItem {
+            ifindex: k.ifindex,
+            logical_iface: topology.by_ifindex(k.ifindex).map(|iface| iface.name.clone()).unwrap_or_default(),
+            subnet: "-".to_string(),
+            ipv4: Vec::new(),
+            ipv6: vec![ip_to_string(&k.ip)],
+            mac: "".to_string(),
+            hostname: "-".to_string(),
+            metrics: CounterQuad::default(),
+            cumulative: CounterQuad::default(),
+            online: true,
+            identity_type: "ip".to_string(),
+            last_seen_ms: now_ms,
+            neighbor_state: None,
+        });
+        let prev = runtime.prev_ipv6_bytes.get(k).copied().unwrap_or(0);
+        let delta = delta_bytes(v.bytes, prev);
+        runtime.prev_ipv6_bytes.insert(*k, v.bytes);
+        fill_quad(k.ip_version, k.direction, &mut entry.metrics, delta, sec);
+    }
+
     for (key, dev) in devices_group.iter_mut() {
         let cum = runtime.cumulative_device.entry(*key).or_default();
         add_quad(cum, &dev.metrics);
         dev.cumulative = *cum;
+    }
+
+    for ((ifindex, ip_key), dev) in ip_devices_group.iter_mut() {
+        let ip_str = ip_key.split_once(':').map(|(_, rest)| rest).unwrap_or(ip_key.as_str());
+        if let Ok(addr) = ip_str.parse::<std::net::Ipv4Addr>() {
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&addr.octets());
+            let cum = runtime.cumulative_ipv4.entry((*ifindex, bytes)).or_default();
+            add_quad(cum, &dev.metrics);
+            dev.cumulative = *cum;
+        } else if let Ok(addr) = ip_str.parse::<std::net::Ipv6Addr>() {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&addr.octets());
+            let cum = runtime.cumulative_ipv6.entry((*ifindex, bytes)).or_default();
+            add_quad(cum, &dev.metrics);
+            dev.cumulative = *cum;
+        }
     }
 
     for (key, dev) in &devices_group {
@@ -1178,6 +1252,7 @@ pub fn collect_snapshot(
 
     let online_keys: HashSet<_> = devices_group.keys().cloned().collect();
     let mut devices: Vec<_> = devices_group.into_values().collect();
+    devices.extend(ip_devices_group.into_values());
     for (key, known) in &runtime.device_registry.entries {
         if online_keys.contains(key) {
             continue;
@@ -1202,6 +1277,7 @@ pub fn collect_snapshot(
             metrics: CounterQuad::default(),
             cumulative: runtime.cumulative_device.get(key).copied().unwrap_or_default(),
             online: false,
+            identity_type: "mac".to_string(),
             last_seen_ms: known.last_seen_ms,
             neighbor_state: None,
         });
@@ -1212,6 +1288,7 @@ pub fn collect_snapshot(
             .cmp(&b.logical_iface)
             .then(a.ipv4.cmp(&b.ipv4))
             .then(a.ipv6.cmp(&b.ipv6))
+            .then(a.mac.cmp(&b.mac))
     });
 
     Ok(SnapshotData {
@@ -1232,6 +1309,14 @@ fn delta_bytes(current: u64, previous: u64) -> u64 {
 }
 
 /// 从 eBPF map 读取接口级流量统计
+fn ip_to_string(bytes: &[u8]) -> String {
+    if bytes.len() == 4 {
+        format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
+    } else {
+        std::net::Ipv6Addr::from(bytes.try_into().unwrap_or([0u8; 16])).to_string()
+    }
+}
+
 fn read_iface_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<InterfaceTrafficKey, TrafficValue>> {
     let map = ebpf
         .map_mut("IFACE_TRAFFIC_STATS")
@@ -1251,6 +1336,32 @@ fn read_device_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<DeviceTrafficKey
         .map_mut("DEVICE_TRAFFIC_STATS")
         .ok_or_else(|| anyhow::anyhow!("DEVICE_TRAFFIC_STATS map not found"))?;
     let map: AyaHashMap<_, DeviceTrafficKey, TrafficValue> = AyaHashMap::try_from(map)?;
+    let mut result = HashMap::new();
+    for entry in map.iter() {
+        let (k, v) = entry?;
+        result.insert(k, v);
+    }
+    Ok(result)
+}
+
+fn read_ipv4_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<Ipv4TrafficKey, TrafficValue>> {
+    let map = ebpf
+        .map_mut("IPV4_TRAFFIC_STATS")
+        .ok_or_else(|| anyhow::anyhow!("IPV4_TRAFFIC_STATS map not found"))?;
+    let map: AyaHashMap<_, Ipv4TrafficKey, TrafficValue> = AyaHashMap::try_from(map)?;
+    let mut result = HashMap::new();
+    for entry in map.iter() {
+        let (k, v) = entry?;
+        result.insert(k, v);
+    }
+    Ok(result)
+}
+
+fn read_ipv6_stats(ebpf: &mut Ebpf) -> anyhow::Result<HashMap<Ipv6TrafficKey, TrafficValue>> {
+    let map = ebpf
+        .map_mut("IPV6_TRAFFIC_STATS")
+        .ok_or_else(|| anyhow::anyhow!("IPV6_TRAFFIC_STATS map not found"))?;
+    let map: AyaHashMap<_, Ipv6TrafficKey, TrafficValue> = AyaHashMap::try_from(map)?;
     let mut result = HashMap::new();
     for entry in map.iter() {
         let (k, v) = entry?;

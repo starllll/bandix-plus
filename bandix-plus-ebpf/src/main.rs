@@ -9,8 +9,8 @@ use aya_ebpf::{
     programs::TcContext,
 };
 use bandix_plus_common::{
-    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, InterfaceTrafficKey, IpVersion, RateBucketValue,
-    RateLimitValue, TrafficDirection, TrafficValue,
+    DeviceGlobalLimitKey, DeviceIfaceLimitKey, DeviceTrafficKey, IfaceLimitKey, InterfaceTrafficKey, Ipv4TrafficKey,
+    Ipv6TrafficKey, IpVersion, RateBucketValue, RateLimitValue, TrafficDirection, TrafficValue,
 };
 
 const ETH_P_IP: u16 = 0x0800;
@@ -53,6 +53,8 @@ struct PppoeSessionHdr {
 struct PacketMeta {
     ip_version: u8,
     mac: Option<[u8; 6]>,
+    src_ip: Option<[u8; 16]>,
+    dst_ip: Option<[u8; 16]>,
 }
 
 #[classifier]
@@ -76,6 +78,12 @@ static IFACE_TRAFFIC_STATS: HashMap<InterfaceTrafficKey, TrafficValue> = HashMap
 
 #[map]
 static DEVICE_TRAFFIC_STATS: HashMap<DeviceTrafficKey, TrafficValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
+
+#[map]
+static IPV4_TRAFFIC_STATS: HashMap<Ipv4TrafficKey, TrafficValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
+
+#[map]
+static IPV6_TRAFFIC_STATS: HashMap<Ipv6TrafficKey, TrafficValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
 
 #[map]
 static DEVICE_LIMIT_GLOBAL: HashMap<DeviceGlobalLimitKey, RateLimitValue> = HashMap::with_max_entries(MAX_ENTRIES, 0);
@@ -119,6 +127,48 @@ fn try_bandix_plus(ctx: TcContext, direction: u8) -> Result<i32, i32> {
         bump_device_counter(&device_key, pkt_len);
     }
 
+    if let Some(src_ip) = meta.src_ip {
+        if meta.ip_version == IpVersion::V4 as u8 {
+            let key = Ipv4TrafficKey {
+                ifindex,
+                ip: [src_ip[0], src_ip[1], src_ip[2], src_ip[3]],
+                ip_version: meta.ip_version,
+                direction,
+                _pad: [0; 2],
+            };
+            bump_ipv4_counter(&key, pkt_len);
+        } else {
+            let key = Ipv6TrafficKey {
+                ifindex,
+                ip: src_ip,
+                ip_version: meta.ip_version,
+                direction,
+            };
+            bump_ipv6_counter(&key, pkt_len);
+        }
+    }
+
+    if let Some(dst_ip) = meta.dst_ip {
+        if meta.ip_version == IpVersion::V4 as u8 {
+            let key = Ipv4TrafficKey {
+                ifindex,
+                ip: [dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]],
+                ip_version: meta.ip_version,
+                direction,
+                _pad: [0; 2],
+            };
+            bump_ipv4_counter(&key, pkt_len);
+        } else {
+            let key = Ipv6TrafficKey {
+                ifindex,
+                ip: dst_ip,
+                ip_version: meta.ip_version,
+                direction,
+            };
+            bump_ipv6_counter(&key, pkt_len);
+        }
+    }
+
     if should_drop_by_rate_limit(ifindex, meta.mac, meta.ip_version, direction, pkt_len) {
         return Ok(TC_ACT_SHOT);
     }
@@ -136,16 +186,27 @@ fn resolve_packet_meta(ctx: &TcContext, direction: u8) -> Option<PacketMeta> {
                 }
                 _ => Some(unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*eth).h_dest)) }),
             };
-            return Some(PacketMeta { ip_version, mac });
+            let ip_offset = if eth_proto == ETH_P_PPP_SES {
+                core::mem::size_of::<EthHdr>() + core::mem::size_of::<PppoeSessionHdr>()
+            } else {
+                core::mem::size_of::<EthHdr>()
+            };
+            let src_ip = resolve_ipv4_or_ipv6(ctx, ip_offset, true);
+            let dst_ip = resolve_ipv4_or_ipv6(ctx, ip_offset, false);
+            return Some(PacketMeta { ip_version, mac, src_ip, dst_ip });
         }
     }
 
     // L3-style interfaces (e.g. ppp/tun/wireguard) may have no Ethernet header.
     if let Some(ip_version) = resolve_ip_version_from_l3(ctx, 0) {
-        return Some(PacketMeta { ip_version, mac: None });
+        let src_ip = resolve_ipv4_or_ipv6(ctx, 0, true);
+        let dst_ip = resolve_ipv4_or_ipv6(ctx, 0, false);
+        return Some(PacketMeta { ip_version, mac: None, src_ip, dst_ip });
     }
     if let Some(ip_version) = resolve_ip_version_from_ppp(ctx) {
-        return Some(PacketMeta { ip_version, mac: None });
+        let src_ip = resolve_ipv4_or_ipv6(ctx, 2, true);
+        let dst_ip = resolve_ipv4_or_ipv6(ctx, 2, false);
+        return Some(PacketMeta { ip_version, mac: None, src_ip, dst_ip });
     }
     None
 }
@@ -227,6 +288,51 @@ fn bump_device_counter(key: &DeviceTrafficKey, bytes: u64) {
 
         let value = TrafficValue { packets: 1, bytes };
         let _ = DEVICE_TRAFFIC_STATS.insert(key, &value, 0);
+    }
+}
+
+fn bump_ipv4_counter(key: &Ipv4TrafficKey, bytes: u64) {
+    unsafe {
+        if let Some(value) = IPV4_TRAFFIC_STATS.get_ptr_mut(key) {
+            (*value).packets = (*value).packets.saturating_add(1);
+            (*value).bytes = (*value).bytes.saturating_add(bytes);
+            return;
+        }
+
+        let value = TrafficValue { packets: 1, bytes };
+        let _ = IPV4_TRAFFIC_STATS.insert(key, &value, 0);
+    }
+}
+
+fn bump_ipv6_counter(key: &Ipv6TrafficKey, bytes: u64) {
+    unsafe {
+        if let Some(value) = IPV6_TRAFFIC_STATS.get_ptr_mut(key) {
+            (*value).packets = (*value).packets.saturating_add(1);
+            (*value).bytes = (*value).bytes.saturating_add(bytes);
+            return;
+        }
+
+        let value = TrafficValue { packets: 1, bytes };
+        let _ = IPV6_TRAFFIC_STATS.insert(key, &value, 0);
+    }
+}
+
+fn resolve_ipv4_or_ipv6(ctx: &TcContext, offset: usize, src: bool) -> Option<[u8; 16]> {
+    let ip_version = resolve_ip_version_from_l3(ctx, offset).or_else(|| resolve_ip_version_from_ppp(ctx))?;
+    match ip_version {
+        x if x == IpVersion::V4 as u8 => {
+            let ip_ptr = ptr_at::<[u8; 4]>(ctx, offset + if src { 12 } else { 16 }).ok()?;
+            let bytes = unsafe { core::ptr::read_unaligned(ip_ptr) };
+            let mut out = [0u8; 16];
+            out[..4].copy_from_slice(&bytes);
+            Some(out)
+        }
+        x if x == IpVersion::V6 as u8 => {
+            let ip_ptr = ptr_at::<[u8; 16]>(ctx, offset + if src { 8 } else { 24 }).ok()?;
+            let bytes = unsafe { core::ptr::read_unaligned(ip_ptr) };
+            Some(bytes)
+        }
+        _ => None,
     }
 }
 

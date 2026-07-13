@@ -1245,6 +1245,7 @@ mod tests {
                 metrics: CounterQuad::default(),
                 cumulative: CounterQuad::default(),
                 online: true,
+                identity_type: "mac".to_string(),
                 last_seen_ms: 0,
                 neighbor_state: Some("REACHABLE".to_string()),
             });
